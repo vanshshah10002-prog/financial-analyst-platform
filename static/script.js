@@ -1,4 +1,22 @@
-/* FinanceIQ v5 — Frontend Logic */
+/* FinanceIQ — Frontend Logic */
+
+// ══════════════ SECURITY UTILITIES ══════════════
+// Escape user/API data before injecting into innerHTML to prevent XSS.
+// Server data isn't trusted: a malicious ticker or news headline could carry markup.
+const _ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+function escapeHtml(value) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/[&<>"']/g, ch => _ESC_MAP[ch]);
+}
+// Numeric coercion that NEVER returns NaN-as-string in the DOM
+function safeNum(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+function safeFixed(value, digits = 2, fallback = '0.00') {
+    const n = Number(value);
+    return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+}
 
 // ══════════════ THEME TOGGLE ══════════════
 function getTheme() { return localStorage.getItem('fiq-theme') || 'dark'; }
@@ -11,32 +29,32 @@ function setTheme(t) {
     if (label) label.textContent = t === 'dark' ? 'Dark Mode' : 'Light Mode';
     if (typeof lucide !== 'undefined') lucide.createIcons();
     // Update charts if they exist
-    if (chartInstance) updateChartTheme();
+    if (typeof klineChart !== 'undefined' && klineChart) klineChart.setStyles(klineStyles());
     if (mcChartInstance) updateMCChartTheme();
 }
 function updateChartTheme() {
     const t = getTheme();
-    const bg = t === 'dark' ? '#141a2a' : '#ffffff';
-    const txt = t === 'dark' ? '#8b95a8' : '#5a6577';
-    const grid = t === 'dark' ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.04)';
-    const border = t === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+    const bg = t === 'dark' ? '#111419' : '#ffffff';
+    const txt = t === 'dark' ? '#969ca6' : '#5c626b';
+    const grid = t === 'dark' ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)';
+    const border = t === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.1)';
     chartInstance.applyOptions({ layout: { background: { color: bg }, textColor: txt }, grid: { vertLines: { color: grid }, horzLines: { color: grid } }, timeScale: { borderColor: border }, rightPriceScale: { borderColor: border } });
 }
 function updateMCChartTheme() {
     const t = getTheme();
-    const bg = t === 'dark' ? '#141a2a' : '#ffffff';
-    const txt = t === 'dark' ? '#8b95a8' : '#5a6577';
-    const grid = t === 'dark' ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.04)';
-    const border = t === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)';
+    const bg = t === 'dark' ? '#111419' : '#ffffff';
+    const txt = t === 'dark' ? '#969ca6' : '#5c626b';
+    const grid = t === 'dark' ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)';
+    const border = t === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.1)';
     mcChartInstance.applyOptions({ layout: { background: { color: bg }, textColor: txt }, grid: { vertLines: { color: grid }, horzLines: { color: grid } }, timeScale: { borderColor: border }, rightPriceScale: { borderColor: border } });
 }
 function getChartColors() {
     const t = getTheme();
     return {
-        bg: t === 'dark' ? '#141a2a' : '#ffffff',
-        text: t === 'dark' ? '#8b95a8' : '#5a6577',
-        grid: t === 'dark' ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.04)',
-        border: t === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)',
+        bg: t === 'dark' ? '#111419' : '#ffffff',
+        text: t === 'dark' ? '#969ca6' : '#5c626b',
+        grid: t === 'dark' ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)',
+        border: t === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.1)',
     };
 }
 // Apply saved theme on load
@@ -57,7 +75,7 @@ document.addEventListener('DOMContentLoaded', () => {
             btn.classList.add('active');
             currentAssetType = btn.dataset.asset;
             const input = document.getElementById('tickerInput');
-            const placeholders = { stocks: 'Search ticker (e.g. AAPL, TSLA, NIFTY)', futures: 'Search futures (e.g. ES=F, NQ=F, GC=F)', options: 'Search underlying (e.g. AAPL, SPY)', currencies: 'Search pair (e.g. USDINR=X, EURUSD=X)' };
+            const placeholders = { stocks: 'Search ticker (e.g. AAPL, TSLA, NIFTY)', futures: 'Search futures (e.g. ES=F, NQ=F, GC=F)', options: 'Search underlying (e.g. AAPL, SPY)', currencies: 'Search pair (e.g. USDINR=X, EURUSD=X)', crypto: 'Search crypto (e.g. BTC-USD, ETH-USD) — live' };
             if (input) input.placeholder = placeholders[currentAssetType] || placeholders.stocks;
             // Filter sidebar nav items by asset type
             filterSidebarByAsset(currentAssetType);
@@ -77,6 +95,7 @@ let currentAssetType = "stocks";
 // Helper: detect asset type from ticker
 function getAssetType(ticker) {
     if (!ticker) return currentAssetType;
+    if (ticker.endsWith('-USD')) return 'crypto';   // BTC-USD, ETH-USD, ...
     if (ticker.endsWith('=F')) return 'futures';
     if (ticker.endsWith('=X')) return 'currencies';
     if (ticker.startsWith('^')) return 'stocks'; // indices treated as stocks
@@ -104,37 +123,29 @@ function filterSidebarByAsset(assetType) {
     });
 }
 
-// ══════════════ CURRENCY STATE ══════════════
-let currencyRates = { USD: 1.0, GBP: 0.79, INR: 83.5 };
-let currentCurrency = "GBP"; // default
-const currencySymbols = { USD: "$", GBP: "£", INR: "₹" };
-
-// Fetch live rates on load
-(async function fetchCurrencyRates() {
-    try {
-        const res = await fetch("/api/currency", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) });
-        const data = await res.json();
-        currencyRates = data;
-    } catch (e) { console.warn("Using fallback currency rates"); }
-})();
-
-function convertCurrency(usdValue) {
+// ══════════════ CURRENCY FORMATTING (USD only) ══════════════
+function fmtCurrency(usdValue) {
     if (usdValue === null || usdValue === undefined || usdValue === "N/A") return "N/A";
     const n = parseFloat(usdValue);
-    if (isNaN(n)) return String(usdValue);
-    return n * currencyRates[currentCurrency];
-}
-function fmtCurrency(usdValue) {
-    const c = convertCurrency(usdValue);
-    if (c === "N/A") return "N/A";
-    const sym = currencySymbols[currentCurrency];
-    return sym + Number(c).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    if (isNaN(n)) return "N/A";
+    return "$" + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-// ══════════════ WELCOME PAGE ══════════════
-document.getElementById("letsBeginBtn").addEventListener("click", () => {
-    document.getElementById("welcomePage").style.display = "none";
-    document.getElementById("mainApp").style.display = "flex";
+// ══════════════ WELCOME GATE ══════════════
+function enterTerminal() {
+    const wp = document.getElementById("welcomePage");
+    const app = document.getElementById("mainApp");
+    if (wp) wp.style.display = "none";
+    if (app) app.style.display = "flex";
+    // focus the command bar so the analyst can type a ticker immediately
+    const ti = document.getElementById("tickerInput");
+    if (ti) ti.focus();
+}
+document.getElementById("letsBeginBtn")?.addEventListener("click", enterTerminal);
+// Enter key on the welcome gate drops straight into the terminal
+document.addEventListener("keydown", e => {
+    const wp = document.getElementById("welcomePage");
+    if (wp && wp.style.display !== "none" && (e.key === "Enter" || e.key === "Escape")) enterTerminal();
 });
 
 // ══════════════ SIDEBAR NAVIGATION ══════════════
@@ -153,10 +164,14 @@ document.querySelectorAll(".nav-item[data-tab]").forEach(btn => {
 // ══════════════ SEARCH / SUGGEST ══════════════
 const tickerInput = document.getElementById("tickerInput");
 const dropdown = document.getElementById("dropdown");
-const timeframeSelect = document.getElementById("timeframeSelect");
-const periodSelect = document.getElementById("periodSelect");
-const currencySelect = document.getElementById("currencySelect");
-const customDates = document.getElementById("customDates");
+// Timeframe/period selectors were removed from the command bar — analysis now
+// defaults to a 1-year window with annual fundamentals. These stubs keep the
+// rest of the code that reads `.value` working without null checks everywhere.
+const DEFAULT_TIMEFRAME = "1Y";
+const DEFAULT_PERIOD = "yearly";
+const timeframeSelect = document.getElementById("timeframeSelect") || { value: DEFAULT_TIMEFRAME, addEventListener() {} };
+const periodSelect = document.getElementById("periodSelect") || { value: DEFAULT_PERIOD };
+const customDates = document.getElementById("customDates") || { style: {} };
 let debounceTimer;
 
 tickerInput.addEventListener("input", () => {
@@ -169,9 +184,9 @@ tickerInput.addEventListener("input", () => {
             const data = await res.json();
             if (!data.length) { dropdown.style.display = "none"; return; }
             dropdown.innerHTML = data.map(d =>
-                `<div class="dropdown-item" data-ticker="${d.ticker}">
-                    <span class="dropdown-ticker">${d.ticker}</span>
-                    <span class="dropdown-name">${d.name}</span>
+                `<div class="dropdown-item" data-ticker="${escapeHtml(d.ticker)}">
+                    <span class="dropdown-ticker">${escapeHtml(d.ticker)}</span>
+                    <span class="dropdown-name">${escapeHtml(d.name)}</span>
                 </div>`
             ).join("");
             dropdown.style.display = "block";
@@ -188,23 +203,26 @@ tickerInput.addEventListener("input", () => {
 tickerInput.addEventListener("keydown", e => { if (e.key === "Enter") { dropdown.style.display = "none"; runAnalysis(); } });
 document.addEventListener("click", e => { if (!e.target.closest(".ticker-wrapper")) dropdown.style.display = "none"; });
 timeframeSelect.addEventListener("change", () => { customDates.style.display = timeframeSelect.value === "custom" ? "flex" : "none"; });
-currencySelect.addEventListener("change", () => {
-    currentCurrency = currencySelect.value;
-    if (analysisData) refreshCurrencyDisplay();
-});
 document.getElementById("analyzeBtn").addEventListener("click", runAnalysis);
 
-// ══════════════ REFRESH CURRENCY DISPLAY ══════════════
-function refreshCurrencyDisplay() {
-    if (!analysisData) return;
-    renderKeyMetrics(analysisData);
-    renderTechnicalIndicators(analysisData);
-    renderFinancials(analysisData);
-    // Re-render items that show currency values
-    if (analysisData._dcf) renderDCFData(analysisData._dcf);
-    if (analysisData._dividends) renderDividendData(analysisData._dividends);
-    if (analysisData._mc) renderMCStats(analysisData._mc);
-}
+// ══════════════ FINANCEIQ LOGO → RETURN TO MARKET PULSE ══════════════
+document.querySelector('.sidebar-brand')?.addEventListener('click', () => {
+    // Clear analysis state
+    analysisData = null;
+    currentTicker = '';
+    tickerInput.value = '';
+    // Show market dashboard, switch to overview
+    const dash = document.getElementById('marketDashboard');
+    if (dash) dash.style.display = '';
+    const resultsContainer = document.getElementById('analysisResults');
+    if (resultsContainer) resultsContainer.style.display = 'none';
+    document.querySelectorAll('.nav-item[data-tab]').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-page').forEach(p => p.classList.remove('active'));
+    document.querySelector('.nav-item[data-tab="overview"]')?.classList.add('active');
+    document.getElementById('page-overview')?.classList.add('active');
+    // Restart dashboard refresh
+    startDashboardRefresh();
+});
 
 // ══════════════ MAIN ANALYSIS ══════════════
 async function runAnalysis() {
@@ -234,6 +252,12 @@ async function runAnalysis() {
         document.querySelector('.nav-item[data-tab="overview"]').classList.add("active");
         document.getElementById("page-overview").classList.add("active");
 
+        // Hide market dashboard when analysis is loaded
+        const dash = document.getElementById('marketDashboard');
+        if (dash) dash.style.display = 'none';
+        const resultsContainer = document.getElementById('analysisResults');
+        if (resultsContainer) resultsContainer.style.display = '';
+
         // Always render chart & key metrics
         renderChart(analysisData);
         renderKeyMetrics(analysisData);
@@ -247,7 +271,6 @@ async function runAnalysis() {
             fetchAnalyst(ticker);
             fetchInsider(ticker);
             fetchEarnings(ticker);
-            fetchDCF(ticker);
             fetchZScore(ticker);
             fetchDividends(ticker);
             fetchHeatmap();
@@ -266,6 +289,12 @@ async function runAnalysis() {
             fetchCorrelation(ticker);
         }
 
+        if (detectedType === 'crypto') {
+            fetchPatterns(ticker, analysisData.price_history);
+            fetchMonteCarlo(ticker, analysisData.price_history);
+            fetchCorrelation(ticker);
+        }
+
         if (detectedType === 'options') {
             // Load the options chain for this ticker
             loadOptionsChainForTicker(ticker);
@@ -277,7 +306,7 @@ async function runAnalysis() {
         fetchAI(ticker);
 
         hideLoader();
-        startLivePolling();
+        // live feed is started inside renderChart() — Binance WS for crypto, delayed poll otherwise
 
     } catch (err) {
         hideLoader();
@@ -290,176 +319,189 @@ function showLoader(msg) { document.getElementById("loader").style.display = "fl
 function updateLoader(msg) { document.getElementById("loaderText").textContent = msg; }
 function hideLoader() { document.getElementById("loader").style.display = "none"; }
 
-// ══════════════ CHART ══════════════
+// ══════════════ CHART (KLineChart + live feed) ══════════════
+let klineChart = null;            // KLineChart instance (main price chart)
 let chartResizeObserver = null;
+let chartPaneIds = {};            // sub-pane indicator name -> paneId
+let currentInterval = '1d';
+let chartFeedWS = null;           // Binance WebSocket (crypto, real-time)
+let chartFeedPoll = null;         // delayed poll (stocks/FX/futures)
 
-function renderChart(data) {
-    const container = document.getElementById("chartContainer");
-    container.innerHTML = "";
-    document.getElementById("chartControls").style.display = "flex";
+const OVERLAY_INDICATORS = { indMA: 'MA', indEMA: 'EMA', indBOLL: 'BOLL' };
+const PANE_INDICATORS = { indVOL: 'VOL', indMACD: 'MACD', indRSI: 'RSI', indKDJ: 'KDJ' };
 
-    // Cleanup previous chart & observer
-    if (chartResizeObserver) { chartResizeObserver.disconnect(); chartResizeObserver = null; }
-    if (chartInstance) { chartInstance.remove(); chartInstance = null; }
-
-    const cc = getChartColors();
-    const rect = container.getBoundingClientRect();
-    chartInstance = LightweightCharts.createChart(container, {
-        width: rect.width || 800,
-        height: rect.height || 420,
-        layout: { background: { color: cc.bg }, textColor: cc.text },
-        grid: { vertLines: { color: cc.grid }, horzLines: { color: cc.grid } },
-        crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-        timeScale: { borderColor: cc.border, timeVisible: false },
-        rightPriceScale: { borderColor: cc.border },
-    });
-
-    // Responsive resize
-    chartResizeObserver = new ResizeObserver(entries => {
-        for (const entry of entries) {
-            const { width, height } = entry.contentRect;
-            if (chartInstance && width > 0 && height > 0) {
-                chartInstance.resize(width, height);
-            }
+function klineStyles() {
+    const dark = getTheme() !== 'light';
+    const grid = dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.06)';
+    const text = dark ? '#969ca6' : '#5c626b';
+    const axis = dark ? '#20252d' : '#e3e3dc';
+    const up = '#2ea37c', down = '#e5484d';
+    return {
+        grid: { horizontal: { color: grid }, vertical: { color: grid } },
+        candle: {
+            bar: { upColor: up, downColor: down, noChangeColor: '#8b95a8',
+                   upBorderColor: up, downBorderColor: down, upWickColor: up, downWickColor: down },
+            priceMark: {
+                high: { color: text }, low: { color: text },
+                last: { upColor: up, downColor: down, noChangeColor: '#8b95a8', text: { color: '#ffffff' } }
+            },
+            tooltip: { text: { color: text } }
+        },
+        indicator: {
+            tooltip: { text: { color: text, family: 'IBM Plex Mono' } },
+            lines: [{ color: '#e0a84e' }, { color: '#06b6d4' }, { color: '#8b5cf6' }, { color: '#ec4899' }]
+        },
+        // wider tick margins + an explicit y-axis width so price/time figures
+        // never clip against the canvas edge
+        xAxis: {
+            axisLine: { color: axis }, tickLine: { color: axis },
+            tickText: { color: text, size: 11, family: 'IBM Plex Mono', marginStart: 6, marginEnd: 8 }
+        },
+        yAxis: {
+            // Fixed width wide enough for full 2-decimal labels on 5–6 figure prices
+            // (e.g. "84,000.00", "162,594.00"). KLineChart's 'auto' under-sizes and
+            // clips the final digit, and a narrower fixed size dropped the last "0".
+            axisLine: { color: axis }, tickLine: { color: axis }, inside: false, size: 110,
+            tickText: { color: text, size: 11, family: 'IBM Plex Mono', marginStart: 10, marginEnd: 18 }
+        },
+        crosshair: {
+            horizontal: { line: { color: text }, text: { color: '#ffffff', backgroundColor: up, family: 'IBM Plex Mono' } },
+            vertical: { line: { color: text }, text: { color: '#ffffff', backgroundColor: up, family: 'IBM Plex Mono' } }
         }
-    });
-    chartResizeObserver.observe(container);
-
-    candleSeries = chartInstance.addCandlestickSeries({
-        upColor: "#22c55e", downColor: "#ef4444",
-        borderUpColor: "#22c55e", borderDownColor: "#ef4444",
-        wickUpColor: "#22c55e", wickDownColor: "#ef4444"
-    });
-
-    // Validate and sort price data
-    const prices = (data.price_history || [])
-        .filter(p => p.date && p.open != null && p.close != null && !isNaN(p.open) && !isNaN(p.close))
-        .map(p => ({
-            time: String(p.date).slice(0, 10),
-            open: Number(p.open),
-            high: Number(p.high),
-            low: Number(p.low),
-            close: Number(p.close)
-        }))
-        .sort((a, b) => a.time.localeCompare(b.time));
-
-    // Remove duplicates (same date)
-    const seen = new Set();
-    const uniquePrices = prices.filter(p => {
-        if (seen.has(p.time)) return false;
-        seen.add(p.time);
-        return true;
-    });
-    candleSeries.setData(uniquePrices);
-
-    volumeSeries = chartInstance.addHistogramSeries({ priceFormat: { type: "volume" }, priceScaleId: "vol" });
-    chartInstance.priceScale("vol").applyOptions({ scaleMargins: { top: 0.85, bottom: 0 } });
-    const volumeData = (data.price_history || [])
-        .filter(p => p.date && p.volume != null)
-        .map(p => ({
-            time: String(p.date).slice(0, 10),
-            value: Number(p.volume) || 0,
-            color: Number(p.close) >= Number(p.open) ? "rgba(34,197,94,0.3)" : "rgba(239,68,68,0.3)"
-        }))
-        .sort((a, b) => a.time.localeCompare(b.time));
-    const seenVol = new Set();
-    volumeSeries.setData(volumeData.filter(p => { if (seenVol.has(p.time)) return false; seenVol.add(p.time); return true; }));
-
-    chartInstance.timeScale().fitContent();
-    overlays = {};
-    setupOverlayToggles(data);
+    };
 }
 
+function binanceInterval(iv) {
+    return ({ '15m': '15m', '1h': '1h', '4h': '4h', '1d': '1d', '1w': '1w' })[iv] || '1d';
+}
 
-function setupOverlayToggles(data) {
-    const prices = data.price_history || [];
-    const closes = prices.map(p => p.close);
-    const times = prices.map(p => p.time || p.date);
+function updateFeedBadge(realtime) {
+    const b = document.getElementById('feedBadge');
+    if (!b) return;
+    if (realtime) { b.textContent = '● LIVE · Binance'; b.className = 'feed-badge live'; }
+    else { b.textContent = '○ Delayed ~15m · Yahoo'; b.className = 'feed-badge delayed'; }
+}
+function flashFeedBadge() {
+    const b = document.getElementById('feedBadge');
+    if (b && b.classList.contains('live')) { b.classList.add('tick'); setTimeout(() => b.classList.remove('tick'), 220); }
+}
 
-    function ema(arr, period) {
-        const k = 2 / (period + 1);
-        const result = [arr[0]];
-        for (let i = 1; i < arr.length; i++) result.push(arr[i] * k + result[i - 1] * (1 - k));
-        return result;
+// Main chart render — fetches candles from /api/klines (Binance for crypto,
+// yfinance for everything else) and starts the appropriate live feed.
+async function renderChart() {
+    const symbol = currentTicker;
+    if (!symbol || typeof klinecharts === 'undefined') return;
+    const container = document.getElementById('chartContainer');
+    if (!container) return;
+    document.getElementById('chartControls').style.display = 'flex';
+
+    if (!klineChart) {
+        klineChart = klinecharts.init(container);
+        klineChart.setStyles(klineStyles());
+        bindChartIndicators();
+        applyDefaultIndicators();
+        if (chartResizeObserver) { try { chartResizeObserver.disconnect(); } catch (_) {} }
+        chartResizeObserver = registerObserver(new ResizeObserver(() => { if (klineChart) klineChart.resize(); }));
+        chartResizeObserver.observe(container);
     }
-    function sma(arr, period) {
-        const result = [];
-        for (let i = 0; i < arr.length; i++) {
-            if (i < period - 1) { result.push(null); continue; }
-            let sum = 0;
-            for (let j = i - period + 1; j <= i; j++) sum += arr[j];
-            result.push(sum / period);
-        }
-        return result;
-    }
 
-    function addLine(id, values, color) {
-        if (overlays[id]) { chartInstance.removeSeries(overlays[id]); delete overlays[id]; }
-        const s = chartInstance.addLineSeries({ color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
-        const d = [];
-        for (let i = 0; i < values.length; i++) { if (values[i] !== null) d.push({ time: times[i], value: values[i] }); }
-        s.setData(d);
-        overlays[id] = s;
-    }
-    function removeLine(id) { if (overlays[id]) { chartInstance.removeSeries(overlays[id]); delete overlays[id]; } }
+    let data;
+    try {
+        const res = await fetch('/api/klines?symbol=' + encodeURIComponent(symbol) + '&interval=' + currentInterval);
+        data = await res.json();
+    } catch (e) { console.error('klines:', e); return; }
 
-    const emaConfig = { togEma5: [5, "#f59e0b"], togEma10: [10, "#06b6d4"], togEma20: [20, "#8b5cf6"], togSma200: [200, "#ec4899"] };
-    Object.entries(emaConfig).forEach(([id, [period, color]]) => {
+    const bars = (data.bars || []).filter(b => b && isFinite(b.close));
+    if (klineChart) klineChart.applyNewData(bars);
+    updateFeedBadge(!!data.realtime);
+    startChartFeed(symbol, !!data.realtime, data.binance_symbol);
+}
+
+function applyDefaultIndicators() {
+    Object.entries(OVERLAY_INDICATORS).forEach(([id, name]) => {
+        const el = document.getElementById(id);
+        if (el && el.checked) klineChart.createIndicator(name, true, { id: 'candle_pane' });
+    });
+    Object.entries(PANE_INDICATORS).forEach(([id, name]) => {
+        const el = document.getElementById(id);
+        if (el && el.checked) { const pid = klineChart.createIndicator(name, false); if (pid) chartPaneIds[name] = pid; }
+    });
+}
+
+function bindChartIndicators() {
+    Object.entries(OVERLAY_INDICATORS).forEach(([id, name]) => {
         const el = document.getElementById(id);
         if (!el) return;
-        el.checked = false;
-        el.onchange = () => {
-            if (el.checked) {
-                const vals = id.startsWith("togSma") ? sma(closes, period) : ema(closes, period);
-                addLine(id, vals, color);
-            } else removeLine(id);
-        };
+        el.addEventListener('change', () => {
+            if (!klineChart) return;
+            if (el.checked) klineChart.createIndicator(name, true, { id: 'candle_pane' });
+            else klineChart.removeIndicator('candle_pane', name);
+        });
     });
+    Object.entries(PANE_INDICATORS).forEach(([id, name]) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('change', () => {
+            if (!klineChart) return;
+            if (el.checked) { const pid = klineChart.createIndicator(name, false); if (pid) chartPaneIds[name] = pid; }
+            else if (chartPaneIds[name]) { klineChart.removeIndicator(chartPaneIds[name], name); delete chartPaneIds[name]; }
+        });
+    });
+    document.querySelectorAll('#intervalSelector .iv-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('#intervalSelector .iv-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            currentInterval = btn.dataset.iv;
+            renderChart();
+        });
+    });
+}
 
-    const bbEl = document.getElementById("togBb");
-    if (bbEl) {
-        bbEl.checked = false;
-        bbEl.onchange = () => {
-            if (bbEl.checked) {
-                const sma20 = sma(closes, 20);
-                const upper = [], lower = [];
-                for (let i = 0; i < closes.length; i++) {
-                    if (sma20[i] === null) { upper.push(null); lower.push(null); continue; }
-                    let sum = 0;
-                    for (let j = i - 19; j <= i; j++) sum += (closes[j] - sma20[i]) ** 2;
-                    const std = Math.sqrt(sum / 20);
-                    upper.push(sma20[i] + 2 * std);
-                    lower.push(sma20[i] - 2 * std);
+// ── Live feed manager ──────────────────────────────────────────────
+function stopChartFeed() {
+    if (chartFeedWS) { try { chartFeedWS.close(); } catch (_) {} chartFeedWS = null; }
+    if (chartFeedPoll) { clearInterval(chartFeedPoll); chartFeedPoll = null; }
+}
+function startChartFeed(symbol, realtime, binanceSymbol) {
+    stopChartFeed();
+    if (realtime && binanceSymbol) {
+        // Real-time crypto via Binance public WebSocket (no key required)
+        const stream = binanceSymbol.toLowerCase() + '@kline_' + binanceInterval(currentInterval);
+        try {
+            chartFeedWS = new WebSocket('wss://data-stream.binance.vision/ws/' + stream);
+            chartFeedWS.onmessage = (msg) => {
+                if (currentTicker !== symbol || !klineChart) return;
+                let k; try { k = JSON.parse(msg.data).k; } catch (_) { return; }
+                if (!k) return;
+                klineChart.updateData({ timestamp: k.t, open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v });
+                updateLivePrice(+k.c);
+                flashFeedBadge();
+            };
+            chartFeedWS.onerror = () => { /* auto-degrade, no crash */ };
+        } catch (e) { console.error('Binance WS:', e); }
+    } else {
+        // Delayed feed: poll /api/live-price every 15s, update the latest candle
+        chartFeedPoll = setInterval(async () => {
+            if (currentTicker !== symbol || !klineChart) return;
+            try {
+                const r = await fetch('/api/live-price', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticker: symbol }) });
+                const d = await r.json();
+                if (d.price && klineChart.getDataList) {
+                    const list = klineChart.getDataList();
+                    if (list && list.length) {
+                        const last = list[list.length - 1];
+                        klineChart.updateData({ timestamp: last.timestamp, open: last.open, high: Math.max(last.high, d.price), low: Math.min(last.low, d.price), close: d.price, volume: last.volume });
+                        updateLivePrice(d.price);
+                    }
                 }
-                addLine("bbUpper", upper, "rgba(99,102,241,0.5)");
-                addLine("bbLower", lower, "rgba(99,102,241,0.5)");
-                addLine("bbMid", sma20, "rgba(99,102,241,0.3)");
-            } else { removeLine("bbUpper"); removeLine("bbLower"); removeLine("bbMid"); }
-        };
+            } catch (_) {}
+        }, 15000);
     }
-
-    const fibEl = document.getElementById("togFib");
-    if (fibEl) {
-        fibEl.checked = false;
-        fibEl.onchange = () => {
-            if (fibEl.checked) {
-                const hi = Math.max(...closes), lo = Math.min(...closes);
-                [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1].forEach((lvl, idx) => {
-                    const val = hi - (hi - lo) * lvl;
-                    const colors = ["#22c55e", "#84cc16", "#eab308", "#f59e0b", "#f97316", "#ef4444", "#dc2626"];
-                    addLine("fib" + idx, closes.map(() => val), colors[idx]);
-                });
-            } else { for (let i = 0; i < 7; i++) removeLine("fib" + i); }
-        };
-    }
-
-    const customBtn = document.getElementById("addCustomEma");
-    if (customBtn) {
-        customBtn.onclick = () => {
-            const period = parseInt(document.getElementById("customEmaPeriod").value);
-            if (period >= 2 && period <= 500) addLine("custom" + period, ema(closes, period), "#a78bfa");
-        };
-    }
+}
+function updateLivePrice(price) {
+    if (analysisData && analysisData.technicals) analysisData.technicals.price = price;
+    const priceEl = document.querySelector('#keyMetrics .data-item .value');
+    if (priceEl) { priceEl.textContent = fmtCurrency(price); priceEl.classList.add('price-flash'); setTimeout(() => priceEl.classList.remove('price-flash'), 600); }
 }
 
 // ══════════════ KEY METRICS ══════════════
@@ -502,19 +544,77 @@ function renderQuickSignal(data) {
         </div>`;
 }
 
-// ══════════════ TECHNICAL INDICATORS ══════════════
+// ══════════════ TECHNICAL INDICATORS (with colors + tooltips) ══════════════
 function renderTechnicalIndicators(data) {
     const t = data.technicals || {};
+    const price = t.price || 0;
     const items = [
-        { label: "EMA 5", value: fmtCurrency(t.ema_5) }, { label: "EMA 10", value: fmtCurrency(t.ema_10) },
-        { label: "EMA 20", value: fmtCurrency(t.ema_20) }, { label: "EMA 50", value: fmtCurrency(t.ema_50) },
-        { label: "SMA 200", value: fmtCurrency(t.sma_200) }, { label: "RSI (14)", value: fmt(t.rsi), cls: t.rsi > 70 ? "negative" : t.rsi < 30 ? "positive" : "" },
-        { label: "MACD", value: fmt(t.macd) }, { label: "MACD Signal", value: fmt(t.macd_signal) },
-        { label: "BB Upper", value: fmtCurrency(t.bb_upper) }, { label: "BB Lower", value: fmtCurrency(t.bb_lower) },
-        { label: "ATR (14)", value: fmtCurrency(t.atr) }, { label: "VWAP", value: fmtCurrency(t.vwap) },
+        {
+            label: "EMA 5", value: fmtCurrency(t.ema_5),
+            cls: price > t.ema_5 ? "positive" : price < t.ema_5 ? "negative" : "",
+            tip: "5-period Exponential Moving Average. Price above = short-term bullish trend."
+        },
+        {
+            label: "EMA 10", value: fmtCurrency(t.ema_10),
+            cls: price > t.ema_10 ? "positive" : price < t.ema_10 ? "negative" : "",
+            tip: "10-period EMA. Tracks short-term momentum direction."
+        },
+        {
+            label: "EMA 20", value: fmtCurrency(t.ema_20),
+            cls: price > t.ema_20 ? "positive" : price < t.ema_20 ? "negative" : "",
+            tip: "20-period EMA. A key support/resistance level for swing traders."
+        },
+        {
+            label: "EMA 50", value: fmtCurrency(t.ema_50),
+            cls: price > t.ema_50 ? "positive" : price < t.ema_50 ? "negative" : "",
+            tip: "50-period EMA. Trend direction indicator — above is bullish, below is bearish."
+        },
+        {
+            label: "SMA 200", value: fmtCurrency(t.sma_200),
+            cls: price > t.sma_200 ? "positive" : price < t.sma_200 ? "negative" : "",
+            tip: "200-day Simple Moving Average. The most-watched long-term trend indicator. Price above = bull market."
+        },
+        {
+            label: "RSI (14)", value: fmt(t.rsi),
+            cls: t.rsi < 30 ? "positive" : t.rsi > 70 ? "negative" : "",
+            tip: "Relative Strength Index (0–100). Below 30 = oversold (buy signal). Above 70 = overbought (sell signal)."
+        },
+        {
+            label: "MACD", value: fmt(t.macd),
+            cls: t.macd > t.macd_signal ? "positive" : "negative",
+            tip: "Moving Average Convergence Divergence. When MACD crosses above Signal → bullish momentum."
+        },
+        {
+            label: "MACD Signal", value: fmt(t.macd_signal),
+            cls: t.macd > t.macd_signal ? "positive" : "negative",
+            tip: "9-period EMA of MACD. Acts as a trigger line for buy/sell signals."
+        },
+        {
+            label: "BB Upper", value: fmtCurrency(t.bb_upper),
+            cls: price > t.bb_upper ? "negative" : "",
+            tip: "Upper Bollinger Band. Price touching or exceeding this level suggests overbought conditions."
+        },
+        {
+            label: "BB Lower", value: fmtCurrency(t.bb_lower),
+            cls: price < t.bb_lower ? "positive" : "",
+            tip: "Lower Bollinger Band. Price touching or below suggests oversold conditions."
+        },
+        {
+            label: "ATR (14)", value: fmtCurrency(t.atr),
+            cls: "",
+            tip: "Average True Range. Measures volatility — higher ATR means bigger price swings."
+        },
+        {
+            label: "VWAP", value: fmtCurrency(t.vwap),
+            cls: price > t.vwap ? "positive" : price < t.vwap ? "negative" : "",
+            tip: "Volume Weighted Average Price. Institutional benchmark — price above VWAP = bullish bias."
+        },
     ];
     document.getElementById("technicalIndicators").innerHTML = items.map(i =>
-        `<div class="data-item"><div class="label">${i.label}</div><div class="value ${i.cls || ""}">${i.value}</div></div>`
+        `<div class="data-item" data-tooltip="${i.tip}">
+            <div class="label">${i.label}</div>
+            <div class="value ${i.cls || ""}">${i.value}</div>
+        </div>`
     ).join("");
 }
 
@@ -736,11 +836,11 @@ function renderMCChart(data) {
     function dayStr(offset) { const d = new Date(today); d.setDate(d.getDate() + offset); return d.toISOString().slice(0, 10); }
 
     const bands = [
-        { key: "p90", color: "rgba(34,197,94,0.4)", label: "P90 (Bull)", lineWidth: 1 },
-        { key: "p75", color: "rgba(34,197,94,0.6)", label: "P75", lineWidth: 1 },
-        { key: "p50", color: "rgba(99,102,241,0.9)", label: "P50 (Median)", lineWidth: 2 },
-        { key: "p25", color: "rgba(239,68,68,0.6)", label: "P25", lineWidth: 1 },
-        { key: "p10", color: "rgba(239,68,68,0.4)", label: "P10 (Bear)", lineWidth: 1 },
+        { key: "p90", color: "rgba(46,163,124,0.4)", label: "P90 (Bull)", lineWidth: 1 },
+        { key: "p75", color: "rgba(46,163,124,0.6)", label: "P75", lineWidth: 1 },
+        { key: "p50", color: "rgba(224,168,78,0.9)", label: "P50 (Median)", lineWidth: 2 },
+        { key: "p25", color: "rgba(229,72,77,0.6)", label: "P25", lineWidth: 1 },
+        { key: "p10", color: "rgba(229,72,77,0.4)", label: "P10 (Bear)", lineWidth: 1 },
     ];
 
     bands.forEach(b => {
@@ -866,24 +966,36 @@ async function fetchCorrelation(ticker) {
         const tickers = data.tickers || [];
         const m = data.matrix || {};
         let html = '<table class="corr-table"><thead><tr><th></th>';
-        tickers.forEach(t => html += `<th>${t}</th>`);
+        tickers.forEach(t => html += `<th>${escapeHtml(t)}</th>`);
         html += '</tr></thead><tbody>';
         tickers.forEach(row => {
-            html += `<tr><td><strong>${row}</strong></td>`;
+            html += `<tr><td><strong>${escapeHtml(row)}</strong></td>`;
             tickers.forEach(col => {
-                const val = (m[col] && m[col][row] !== undefined) ? m[col][row] : 0;
-                const bg = corrColor(val);
-                html += `<td style="background:${bg};color:${Math.abs(val) > 0.5 ? 'white' : 'var(--text-secondary)'};font-weight:${Math.abs(val) > 0.7 ? '700' : '400'}">${val.toFixed(2)}</td>`;
+                // value can legitimately be null (e.g. a benchmark with misaligned
+                // dates) — guard so a single null doesn't crash the whole render.
+                const raw = (m[col] && m[col][row] !== undefined && m[col][row] !== null) ? Number(m[col][row]) : null;
+                if (raw === null || !Number.isFinite(raw)) {
+                    html += `<td class="corr-na">—</td>`;
+                    return;
+                }
+                const bg = corrColor(raw);
+                const strong = Math.abs(raw) > 0.7 ? '600' : '400';
+                const fg = Math.abs(raw) > 0.5 ? '#fff' : 'var(--text-secondary)';
+                html += `<td style="background:${bg};color:${fg};font-weight:${strong}">${raw.toFixed(2)}</td>`;
             });
             html += '</tr>';
         });
         html += '</tbody></table>';
         el.innerHTML = html;
-    } catch (e) { console.error("Correlation:", e); }
+    } catch (e) {
+        console.error("Correlation:", e);
+        const elc = document.getElementById("correlationMatrix");
+        if (elc) elc.innerHTML = '<p class="ai-placeholder">Correlation data unavailable.</p>';
+    }
 }
 function corrColor(val) {
-    if (val >= 0) return `rgba(34,197,94,${Math.abs(val) * 0.6})`;
-    return `rgba(239,68,68,${Math.abs(val) * 0.6})`;
+    if (val >= 0) return `rgba(46,163,124,${Math.min(Math.abs(val) * 0.65, 0.85)})`;
+    return `rgba(229,72,77,${Math.min(Math.abs(val) * 0.65, 0.85)})`;
 }
 
 // ══════════════ FETCH: SECTOR HEATMAP ══════════════
@@ -916,7 +1028,7 @@ function renderHeatmap(tf) {
         return;
     }
     document.getElementById("sectorHeatmap").innerHTML = entries.map(([name, pct]) => {
-        const bg = pct >= 0 ? `rgba(34,197,94,${Math.min(Math.abs(pct) / 5, 0.7) + 0.1})` : `rgba(239,68,68,${Math.min(Math.abs(pct) / 5, 0.7) + 0.1})`;
+        const bg = pct >= 0 ? `rgba(46,163,124,${Math.min(Math.abs(pct) / 5, 0.7) + 0.1})` : `rgba(229,72,77,${Math.min(Math.abs(pct) / 5, 0.7) + 0.1})`;
         const color = Math.abs(pct) > 1 ? "white" : "var(--text-secondary)";
         return `<div class="heatmap-cell" style="background:${bg};color:${color}"><div class="sector-name">${name}</div><div class="sector-pct">${pct > 0 ? "+" : ""}${pct.toFixed(2)}%</div></div>`;
     }).join("");
@@ -1015,64 +1127,41 @@ function fmtLarge(v) {
 }
 function fmtCurrencyLarge(v) {
     if (v === null || v === undefined || v === "N/A") return "N/A";
-    const converted = convertCurrency(v);
-    if (converted === "N/A") return "N/A";
-    const sym = currencySymbols[currentCurrency];
-    const n = Number(converted);
+    const n = parseFloat(v);
     if (isNaN(n)) return String(v);
-    if (Math.abs(n) >= 1e12) return sym + (n / 1e12).toFixed(2) + "T";
-    if (Math.abs(n) >= 1e9) return sym + (n / 1e9).toFixed(2) + "B";
-    if (Math.abs(n) >= 1e6) return sym + (n / 1e6).toFixed(2) + "M";
-    if (Math.abs(n) >= 1e3) return sym + (n / 1e3).toFixed(1) + "K";
-    return sym + n.toFixed(2);
+    if (Math.abs(n) >= 1e12) return "$" + (n / 1e12).toFixed(2) + "T";
+    if (Math.abs(n) >= 1e9) return "$" + (n / 1e9).toFixed(2) + "B";
+    if (Math.abs(n) >= 1e6) return "$" + (n / 1e6).toFixed(2) + "M";
+    if (Math.abs(n) >= 1e3) return "$" + (n / 1e3).toFixed(1) + "K";
+    return "$" + n.toFixed(2);
 }
 
-// ══════════════ LIVE PRICE AUTO-REFRESH (15s) ══════════════
-let livePollInterval = null;
+// ══════════════ LIVE FEED (back-compat shim) ══════════════
+// The chart's own startChartFeed/stopChartFeed manage live data now.
+// stopLivePolling is kept as an alias so teardownEverything keeps working.
+function stopLivePolling() { stopChartFeed(); }
 
-function startLivePolling() {
+// ── Global cleanup: stop intervals + disconnect observers on page hide/unload ──
+// Without this, switching tabs leaves polling running in the background and rapid
+// ticker switches accumulate ResizeObservers, which leaks memory.
+const _activeObservers = new Set();
+function registerObserver(obs) { if (obs) _activeObservers.add(obs); return obs; }
+function teardownEverything() {
     stopLivePolling();
-    livePollInterval = setInterval(async () => {
-        if (!currentTicker) return;
-        try {
-            const res = await fetch("/api/live-price", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ ticker: currentTicker })
-            });
-            const data = await res.json();
-            if (data.price && analysisData && analysisData.technicals) {
-                analysisData.technicals.price = data.price;
-                // Update the price display in Key Metrics
-                const priceEl = document.querySelector("#keyMetrics .data-item .data-value");
-                if (priceEl) {
-                    priceEl.textContent = fmtCurrency(data.price);
-                    priceEl.classList.add("price-flash");
-                    setTimeout(() => priceEl.classList.remove("price-flash"), 600);
-                }
-                // Update last candle on chart if available
-                if (candleSeries && data.price) {
-                    const now = new Date();
-                    const todayStr = now.toISOString().slice(0, 10);
-                    candleSeries.update({
-                        time: todayStr,
-                        open: data.price,
-                        high: data.price,
-                        low: data.price,
-                        close: data.price,
-                    });
-                }
-            }
-        } catch (e) { /* silent fail for polling */ }
-    }, 15000);
-}
-
-function stopLivePolling() {
-    if (livePollInterval) {
-        clearInterval(livePollInterval);
-        livePollInterval = null;
+    if (typeof dashboardInterval !== 'undefined' && dashboardInterval) {
+        clearInterval(dashboardInterval);
+        dashboardInterval = null;
     }
+    _activeObservers.forEach(obs => { try { obs.disconnect(); } catch (_) {} });
+    _activeObservers.clear();
 }
+window.addEventListener('beforeunload', teardownEverything);
+// pagehide fires for back/forward cache scenarios where beforeunload may not.
+window.addEventListener('pagehide', teardownEverything);
+// Pause polling when tab is hidden (saves API quota + battery)
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) stopLivePolling();
+});
 
 // Start polling after each analysis
 const origRunAnalysis = runAnalysis;
@@ -1090,12 +1179,15 @@ async function loadOptionsChainForTicker(ticker) {
         });
         optionsChainData = await res.json();
         if (optionsChainData.error) {
-            document.getElementById("optionsChainTable").innerHTML = `<p class="ai-placeholder">${optionsChainData.error}</p>`;
+            document.getElementById("optionsChainTable").innerHTML =
+                `<p class="ai-placeholder">${escapeHtml(optionsChainData.error)}</p>`;
             return;
         }
         // Populate expiry selector
         const sel = document.getElementById("optExpiry");
-        sel.innerHTML = (optionsChainData.expirations || []).map(e => `<option value="${e}" ${e === optionsChainData.expiration ? 'selected' : ''}>${e}</option>`).join("");
+        sel.innerHTML = (optionsChainData.expirations || []).map(e =>
+            `<option value="${escapeHtml(e)}" ${e === optionsChainData.expiration ? 'selected' : ''}>${escapeHtml(e)}</option>`
+        ).join("");
         // Set payoff strike default to current price
         if (optionsChainData.current_price) {
             document.getElementById("payoffStrike").value = Math.round(optionsChainData.current_price);
@@ -1119,20 +1211,21 @@ function renderOptionsChain() {
         <th>Delta</th><th>Gamma</th><th>Theta</th><th>Vega</th>
     </tr></thead><tbody>`;
     for (const opt of data) {
-        const itm = (showCallsOrPuts === 'calls' && opt.strike < curPrice) || (showCallsOrPuts === 'puts' && opt.strike > curPrice);
+        const strike = safeNum(opt.strike);
+        const itm = (showCallsOrPuts === 'calls' && strike < curPrice) || (showCallsOrPuts === 'puts' && strike > curPrice);
         const cls = itm ? ' class="positive"' : '';
         html += `<tr${cls}>
-            <td><strong>${opt.strike}</strong></td>
-            <td>${(opt.lastPrice || 0).toFixed(2)}</td>
-            <td>${(opt.bid || 0).toFixed(2)}</td>
-            <td>${(opt.ask || 0).toFixed(2)}</td>
-            <td>${(opt.volume || 0).toLocaleString()}</td>
-            <td>${(opt.openInterest || 0).toLocaleString()}</td>
-            <td>${((opt.impliedVolatility || 0) * 100).toFixed(1)}%</td>
-            <td>${(opt.delta || 0).toFixed(4)}</td>
-            <td>${(opt.gamma || 0).toFixed(6)}</td>
-            <td>${(opt.theta || 0).toFixed(4)}</td>
-            <td>${(opt.vega || 0).toFixed(4)}</td>
+            <td><strong>${safeFixed(strike, 2)}</strong></td>
+            <td>${safeFixed(opt.lastPrice, 2)}</td>
+            <td>${safeFixed(opt.bid, 2)}</td>
+            <td>${safeFixed(opt.ask, 2)}</td>
+            <td>${safeNum(opt.volume).toLocaleString()}</td>
+            <td>${safeNum(opt.openInterest).toLocaleString()}</td>
+            <td>${safeFixed(safeNum(opt.impliedVolatility) * 100, 1)}%</td>
+            <td>${safeFixed(opt.delta, 4)}</td>
+            <td>${safeFixed(opt.gamma, 6)}</td>
+            <td>${safeFixed(opt.theta, 4)}</td>
+            <td>${safeFixed(opt.vega, 4)}</td>
         </tr>`;
     }
     html += '</tbody></table>';
@@ -1193,11 +1286,11 @@ function renderPayoffChart(points, strike) {
         grid: { vertLines: { color: cc.grid }, horzLines: { color: cc.grid } },
         rightPriceScale: { borderColor: cc.border },
     });
-    const series = payoffChartInstance.addLineSeries({ color: '#6366f1', lineWidth: 2 });
+    const series = payoffChartInstance.addLineSeries({ color: '#e0a84e', lineWidth: 2 });
     const d = points.map((p, i) => ({ time: i + 1, value: p.profit }));
     series.setData(d);
     // Add zero line
-    const zeroLine = payoffChartInstance.addLineSeries({ color: 'rgba(255,255,255,0.2)', lineWidth: 1, lineStyle: 2 });
+    const zeroLine = payoffChartInstance.addLineSeries({ color: 'rgba(150,156,166,0.35)', lineWidth: 1, lineStyle: 2 });
     zeroLine.setData(d.map(p => ({ time: p.time, value: 0 })));
     payoffChartInstance.timeScale().fitContent();
 }
@@ -1219,16 +1312,21 @@ function renderMarketCards(containerId, items) {
     const container = document.getElementById(containerId);
     if (!container || !items.length) return;
     container.innerHTML = items.map(item => {
-        const sign = item.change >= 0 ? '+' : '';
-        const cls = item.change >= 0 ? 'positive' : 'negative';
-        const arrow = item.change >= 0 ? '▲' : '▼';
+        const price = safeNum(item.price);
+        const change = safeNum(item.change);
+        const changePct = safeNum(item.change_pct);
+        const sign = change >= 0 ? '+' : '';
+        const cls = change >= 0 ? 'positive' : 'negative';
+        const arrow = change >= 0 ? '▲' : '▼';
+        const priceStr = price > 0
+            ? price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+            : '—';
         return `<div class="market-card">
-            <div class="mc-name">${item.name}</div>
-            <div class="mc-price" data-target="${item.price}">${item.price > 0 ? item.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'}</div>
-            <div class="mc-change ${cls}">${arrow} ${sign}${item.change.toFixed(2)} (${sign}${item.change_pct.toFixed(2)}%)</div>
+            <div class="mc-name">${escapeHtml(item.name)}</div>
+            <div class="mc-price" data-target="${price}">${priceStr}</div>
+            <div class="mc-change ${cls}">${arrow} ${sign}${safeFixed(change, 2)} (${sign}${safeFixed(changePct, 2)}%)</div>
         </div>`;
     }).join('');
-    // Animate counters
     container.querySelectorAll('.mc-price[data-target]').forEach(el => {
         animateCounter(el, parseFloat(el.dataset.target));
     });
@@ -1310,19 +1408,21 @@ function renderPositionsTable(positions) {
         <th>Ticker</th><th>Side</th><th>Type</th><th>Shares</th><th>Avg Cost</th><th>Current</th><th>Value</th><th>P&L</th><th>P&L %</th><th>Alloc %</th>
     </tr></thead><tbody>`;
     for (const p of positions) {
-        const pnlClass = p.pnl >= 0 ? 'positive' : 'negative';
+        const pnl = safeNum(p.pnl);
+        const pnlPct = safeNum(p.pnl_pct);
+        const pnlClass = pnl >= 0 ? 'positive' : 'negative';
         const sideClass = p.side === 'LONG' ? 'positive' : 'negative';
         html += `<tr>
-            <td><strong>${p.ticker}</strong></td>
-            <td class="${sideClass}">${p.side}</td>
-            <td>${p.asset_type}</td>
-            <td>${p.shares}</td>
-            <td>$${p.avg_cost.toFixed(2)}</td>
-            <td>$${p.current_price.toFixed(2)}</td>
-            <td>$${p.market_value.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
-            <td class="${pnlClass}">${p.pnl >= 0 ? '+' : ''}$${p.pnl.toFixed(2)}</td>
-            <td class="${pnlClass}">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</td>
-            <td>${p.allocation_pct.toFixed(1)}%</td>
+            <td><strong>${escapeHtml(p.ticker)}</strong></td>
+            <td class="${sideClass}">${escapeHtml(p.side)}</td>
+            <td>${escapeHtml(p.asset_type)}</td>
+            <td>${safeNum(p.shares)}</td>
+            <td>$${safeFixed(p.avg_cost, 2)}</td>
+            <td>$${safeFixed(p.current_price, 2)}</td>
+            <td>$${safeNum(p.market_value).toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+            <td class="${pnlClass}">${pnl >= 0 ? '+' : ''}$${safeFixed(pnl, 2)}</td>
+            <td class="${pnlClass}">${pnlPct >= 0 ? '+' : ''}${safeFixed(pnlPct, 2)}%</td>
+            <td>${safeFixed(p.allocation_pct, 1)}%</td>
         </tr>`;
     }
     html += '</tbody></table>';
@@ -1340,19 +1440,24 @@ function renderPendingOrders(orders) {
         <th>ID</th><th>Type</th><th>Side</th><th>Ticker</th><th>Shares</th><th>Target Price</th><th>Created</th><th>Action</th>
     </tr></thead><tbody>`;
     for (const o of orders) {
+        const id = safeNum(o.id);  // coerce to numeric — never trust raw server payload in an onclick
         html += `<tr>
-            <td>#${o.id}</td>
-            <td>${o.order_type}</td>
-            <td class="${o.side === 'BUY' ? 'positive' : 'negative'}">${o.side}</td>
-            <td><strong>${o.ticker}</strong></td>
-            <td>${o.shares}</td>
-            <td>$${o.target_price.toFixed(2)}</td>
-            <td>${o.created_at}</td>
-            <td><button class="btn-sm btn-danger" onclick="cancelPendingOrder(${o.id})">Cancel</button></td>
+            <td>#${id}</td>
+            <td>${escapeHtml(o.order_type)}</td>
+            <td class="${o.side === 'BUY' ? 'positive' : 'negative'}">${escapeHtml(o.side)}</td>
+            <td><strong>${escapeHtml(o.ticker)}</strong></td>
+            <td>${safeNum(o.shares)}</td>
+            <td>$${safeFixed(o.target_price, 2)}</td>
+            <td>${escapeHtml(o.created_at)}</td>
+            <td><button class="btn-sm btn-danger" data-cancel-id="${id}">Cancel</button></td>
         </tr>`;
     }
     html += '</tbody></table>';
     container.innerHTML = html;
+    // Wire up cancel buttons via event delegation (avoids inline onclick injection)
+    container.querySelectorAll('button[data-cancel-id]').forEach(btn => {
+        btn.addEventListener('click', () => cancelPendingOrder(Number(btn.dataset.cancelId)));
+    });
 }
 
 async function cancelPendingOrder(orderId) {
@@ -1384,16 +1489,16 @@ async function loadEquityCurve() {
         equityCurveChart = LightweightCharts.createChart(container, {
             width: container.clientWidth,
             height: 260,
-            layout: { background: { type: 'solid', color: 'transparent' }, textColor: isDark ? '#94a3b8' : '#64748b' },
+            layout: { background: { type: 'solid', color: 'transparent' }, textColor: isDark ? '#969ca6' : '#5c626b' },
             grid: { vertLines: { visible: false }, horzLines: { color: isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.06)' } },
             rightPriceScale: { borderVisible: false },
             timeScale: { borderVisible: false },
         });
 
         const series = equityCurveChart.addAreaSeries({
-            topColor: 'rgba(99,102,241,0.3)',
-            bottomColor: 'rgba(99,102,241,0.02)',
-            lineColor: '#6366f1',
+            topColor: 'rgba(224,168,78,0.3)',
+            bottomColor: 'rgba(224,168,78,0.02)',
+            lineColor: '#e0a84e',
             lineWidth: 2,
         });
 
@@ -1417,9 +1522,9 @@ async function loadEquityCurve() {
             equityCurveChart.timeScale().fitContent();
         }
 
-        new ResizeObserver(() => {
+        registerObserver(new ResizeObserver(() => {
             equityCurveChart?.applyOptions({ width: container.clientWidth });
-        }).observe(container);
+        })).observe(container);
     } catch (e) { console.error("Equity curve:", e); }
 }
 
@@ -1468,17 +1573,20 @@ async function loadTransactionHistory() {
         for (const t of data.transactions) {
             const actionColors = { BUY: 'positive', SELL: 'negative', SHORT: 'negative', COVER: 'positive' };
             const actionClass = actionColors[t.action] || '';
-            const pnlStr = t.pnl != null ? `<span class="${t.pnl >= 0 ? 'positive' : 'negative'}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}</span>` : '—';
+            const pnl = safeNum(t.pnl, null);
+            const pnlStr = pnl !== null
+                ? `<span class="${pnl >= 0 ? 'positive' : 'negative'}">${pnl >= 0 ? '+' : ''}$${safeFixed(pnl, 2)}</span>`
+                : '—';
             html += `<tr>
-                <td>${t.timestamp}</td>
-                <td class="${actionClass}"><strong>${t.action}</strong></td>
-                <td>${t.side || 'LONG'}</td>
-                <td>${t.ticker}</td>
-                <td>${t.shares}</td>
-                <td>$${t.price.toFixed(4)}</td>
-                <td>$${(t.slippage || 0).toFixed(4)}</td>
-                <td>$${(t.commission || 0).toFixed(2)}</td>
-                <td>$${t.total.toFixed(2)}</td>
+                <td>${escapeHtml(t.timestamp)}</td>
+                <td class="${actionClass}"><strong>${escapeHtml(t.action)}</strong></td>
+                <td>${escapeHtml(t.side || 'LONG')}</td>
+                <td>${escapeHtml(t.ticker)}</td>
+                <td>${safeNum(t.shares)}</td>
+                <td>$${safeFixed(t.price, 4)}</td>
+                <td>$${safeFixed(t.slippage, 4)}</td>
+                <td>$${safeFixed(t.commission, 2)}</td>
+                <td>$${safeFixed(t.total, 2)}</td>
                 <td>${pnlStr}</td>
             </tr>`;
         }
@@ -1512,9 +1620,9 @@ document.getElementById("tradeTicker")?.addEventListener("input", async (e) => {
             const results = await res.json();
             if (!results.length) { dropdown.classList.remove("open"); return; }
             dropdown.innerHTML = results.slice(0, 8).map(r =>
-                `<div class="trade-dropdown-item" data-ticker="${r.ticker}">
-                    <span class="ticker-sym">${r.ticker}</span>
-                    <span class="ticker-name">${r.name}</span>
+                `<div class="trade-dropdown-item" data-ticker="${escapeHtml(r.ticker)}">
+                    <span class="ticker-sym">${escapeHtml(r.ticker)}</span>
+                    <span class="ticker-name">${escapeHtml(r.name)}</span>
                 </div>`
             ).join('');
             dropdown.classList.add("open");

@@ -12,20 +12,53 @@ Features inspired by hftbacktest:
 import sqlite3
 import os
 import math
+import logging
+from contextlib import contextmanager
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.db")
+DB_PATH = os.environ.get(
+    "PORTFOLIO_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.db"),
+)
 INITIAL_CASH = 100000.00
 DEFAULT_SLIPPAGE_BPS = 5      # 0.05% default slippage
 DEFAULT_COMMISSION_PER_SHARE = 0.005  # $0.005 per share (IBKR-style)
 MIN_COMMISSION = 1.00          # $1 minimum per trade
 
+log = logging.getLogger("financeiq.portfolio")
+
+
+@contextmanager
+def txn(conn):
+    """Explicit transaction boundary.
+
+    sqlite3 in autocommit-mode-with-implicit-transactions is a known footgun:
+    multi-statement ops can be split if anything between them raises. This wraps
+    a block in BEGIN IMMEDIATE / COMMIT and rolls back on any exception so the
+    portfolio never ends up half-updated.
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except sqlite3.Error:  # already rolled back / connection closed
+            pass
+        log.exception("portfolio transaction rolled back")
+        raise
+
 
 def get_db():
     """Get database connection and ensure tables exist."""
-    conn = sqlite3.connect(DB_PATH)
+    # 5s busy timeout — under WAL another writer briefly holding the lock is normal.
+    conn = sqlite3.connect(DB_PATH, timeout=5.0, isolation_level=None)  # autocommit, we drive txns
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")   # safe + faster than FULL under WAL
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS portfolio_meta (
@@ -105,7 +138,6 @@ def get_db():
     cursor = conn.execute("SELECT COUNT(*) FROM portfolio_meta")
     if cursor.fetchone()[0] == 0:
         conn.execute("INSERT INTO portfolio_meta (id, cash) VALUES (1, ?)", (INITIAL_CASH,))
-    conn.commit()
     return conn
 
 
@@ -143,234 +175,257 @@ def get_positions():
 
 
 def buy(ticker, shares, price, asset_type="stock"):
-    """Buy shares (long) with slippage and commission."""
+    """Buy shares (long) with slippage and commission. Atomic."""
     if shares <= 0 or price <= 0:
         return {"error": "Invalid shares or price"}
 
     conn = get_db()
-    meta = _get_meta(conn)
-    cash = meta["cash"]
-    slippage_bps = meta["slippage_bps"]
-    comm_per_share = meta["commission_per_share"]
+    try:
+        with txn(conn):
+            meta = _get_meta(conn)
+            cash = meta["cash"]
+            slippage_bps = meta["slippage_bps"]
+            comm_per_share = meta["commission_per_share"]
 
-    # Apply slippage
-    slip = _calc_slippage(price, shares, slippage_bps, "BUY")
-    exec_price = price + slip
+            slip = _calc_slippage(price, shares, slippage_bps, "BUY")
+            exec_price = price + slip
+            commission = _calc_commission(shares, comm_per_share)
+            total_cost = shares * exec_price + commission
 
-    # Calculate commission
-    commission = _calc_commission(shares, comm_per_share)
+            if total_cost > cash:
+                return {"error": f"Insufficient cash. Need ${total_cost:.2f}, have ${cash:.2f}"}
 
-    total_cost = shares * exec_price + commission
+            new_cash = cash - total_cost
+            conn.execute(
+                "UPDATE portfolio_meta SET cash = ?, updated_at = datetime('now') WHERE id = 1",
+                (new_cash,),
+            )
 
-    if total_cost > cash:
+            existing = conn.execute(
+                "SELECT * FROM positions WHERE ticker = ? AND side = 'LONG'", (ticker,)
+            ).fetchone()
+            if existing:
+                old_shares = existing["shares"]
+                old_avg = existing["avg_cost"]
+                new_shares = old_shares + shares
+                new_avg = ((old_shares * old_avg) + (shares * exec_price)) / new_shares
+                conn.execute(
+                    "UPDATE positions SET shares = ?, avg_cost = ?, updated_at = datetime('now') "
+                    "WHERE ticker = ? AND side = 'LONG'",
+                    (new_shares, new_avg, ticker),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO positions (ticker, asset_type, shares, avg_cost, side) "
+                    "VALUES (?, ?, ?, ?, 'LONG')",
+                    (ticker, asset_type, shares, exec_price),
+                )
+
+            conn.execute(
+                "INSERT INTO transactions (ticker, asset_type, action, side, shares, price, "
+                "slippage, commission, total) "
+                "VALUES (?, ?, 'BUY', 'LONG', ?, ?, ?, ?, ?)",
+                (ticker, asset_type, shares, exec_price, slip * shares, commission, total_cost),
+            )
+        return {
+            "success": True, "action": "BUY", "ticker": ticker,
+            "shares": shares, "price": round(exec_price, 4),
+            "slippage": round(slip, 4), "commission": round(commission, 2),
+            "total": round(total_cost, 2), "remaining_cash": round(new_cash, 2),
+        }
+    finally:
         conn.close()
-        return {"error": f"Insufficient cash. Need ${total_cost:.2f}, have ${cash:.2f}"}
-
-    new_cash = cash - total_cost
-    conn.execute("UPDATE portfolio_meta SET cash = ?, updated_at = datetime('now') WHERE id = 1", (new_cash,))
-
-    existing = conn.execute("SELECT * FROM positions WHERE ticker = ? AND side = 'LONG'", (ticker,)).fetchone()
-    if existing:
-        old_shares = existing["shares"]
-        old_avg = existing["avg_cost"]
-        new_shares = old_shares + shares
-        new_avg = ((old_shares * old_avg) + (shares * exec_price)) / new_shares
-        conn.execute(
-            "UPDATE positions SET shares = ?, avg_cost = ?, updated_at = datetime('now') WHERE ticker = ? AND side = 'LONG'",
-            (new_shares, new_avg, ticker)
-        )
-    else:
-        conn.execute(
-            "INSERT INTO positions (ticker, asset_type, shares, avg_cost, side) VALUES (?, ?, ?, ?, 'LONG')",
-            (ticker, asset_type, shares, exec_price)
-        )
-
-    conn.execute(
-        """INSERT INTO transactions (ticker, asset_type, action, side, shares, price, slippage, commission, total)
-           VALUES (?, ?, 'BUY', 'LONG', ?, ?, ?, ?, ?)""",
-        (ticker, asset_type, shares, exec_price, slip * shares, commission, total_cost)
-    )
-    conn.commit()
-    conn.close()
-
-    return {
-        "success": True, "action": "BUY", "ticker": ticker,
-        "shares": shares, "price": round(exec_price, 4),
-        "slippage": round(slip, 4), "commission": round(commission, 2),
-        "total": round(total_cost, 2), "remaining_cash": round(new_cash, 2)
-    }
 
 
 def sell(ticker, shares, price):
-    """Sell long shares with slippage and commission."""
+    """Sell long shares with slippage and commission. Atomic."""
     if shares <= 0 or price <= 0:
         return {"error": "Invalid shares or price"}
 
     conn = get_db()
-    meta = _get_meta(conn)
-    slippage_bps = meta["slippage_bps"]
-    comm_per_share = meta["commission_per_share"]
+    try:
+        with txn(conn):
+            meta = _get_meta(conn)
+            slippage_bps = meta["slippage_bps"]
+            comm_per_share = meta["commission_per_share"]
 
-    existing = conn.execute("SELECT * FROM positions WHERE ticker = ? AND side = 'LONG'", (ticker,)).fetchone()
-    if not existing or existing["shares"] < shares:
+            existing = conn.execute(
+                "SELECT * FROM positions WHERE ticker = ? AND side = 'LONG'", (ticker,)
+            ).fetchone()
+            if not existing or existing["shares"] < shares:
+                available = existing["shares"] if existing else 0
+                return {"error": f"Insufficient shares. Have {available}, trying to sell {shares}"}
+
+            slip = _calc_slippage(price, shares, slippage_bps, "SELL")
+            exec_price = price + slip  # slip is negative for sells
+            commission = _calc_commission(shares, comm_per_share)
+            total_proceeds = shares * exec_price - commission
+
+            new_shares = existing["shares"] - shares
+            cash = meta["cash"]
+            new_cash = cash + total_proceeds
+
+            conn.execute(
+                "UPDATE portfolio_meta SET cash = ?, updated_at = datetime('now') WHERE id = 1",
+                (new_cash,),
+            )
+
+            if new_shares <= 0:
+                conn.execute("DELETE FROM positions WHERE ticker = ? AND side = 'LONG'", (ticker,))
+            else:
+                conn.execute(
+                    "UPDATE positions SET shares = ?, updated_at = datetime('now') "
+                    "WHERE ticker = ? AND side = 'LONG'",
+                    (new_shares, ticker),
+                )
+
+            pnl = (exec_price - existing["avg_cost"]) * shares - commission
+            conn.execute(
+                "INSERT INTO transactions (ticker, asset_type, action, side, shares, price, "
+                "slippage, commission, total, pnl) "
+                "VALUES (?, ?, 'SELL', 'LONG', ?, ?, ?, ?, ?, ?)",
+                (ticker, existing["asset_type"], shares, exec_price, slip * shares,
+                 commission, total_proceeds, pnl),
+            )
+        return {
+            "success": True, "action": "SELL", "ticker": ticker,
+            "shares": shares, "price": round(exec_price, 4),
+            "slippage": round(slip, 4), "commission": round(commission, 2),
+            "total": round(total_proceeds, 2), "pnl": round(pnl, 2),
+            "remaining_cash": round(new_cash, 2),
+        }
+    finally:
         conn.close()
-        available = existing["shares"] if existing else 0
-        return {"error": f"Insufficient shares. Have {available}, trying to sell {shares}"}
-
-    slip = _calc_slippage(price, shares, slippage_bps, "SELL")
-    exec_price = price + slip  # slip is negative for sells
-    commission = _calc_commission(shares, comm_per_share)
-    total_proceeds = shares * exec_price - commission
-
-    new_shares = existing["shares"] - shares
-    cash = meta["cash"]
-    new_cash = cash + total_proceeds
-
-    conn.execute("UPDATE portfolio_meta SET cash = ?, updated_at = datetime('now') WHERE id = 1", (new_cash,))
-
-    if new_shares <= 0:
-        conn.execute("DELETE FROM positions WHERE ticker = ? AND side = 'LONG'", (ticker,))
-    else:
-        conn.execute(
-            "UPDATE positions SET shares = ?, updated_at = datetime('now') WHERE ticker = ? AND side = 'LONG'",
-            (new_shares, ticker)
-        )
-
-    pnl = (exec_price - existing["avg_cost"]) * shares - commission
-    conn.execute(
-        """INSERT INTO transactions (ticker, asset_type, action, side, shares, price, slippage, commission, total, pnl)
-           VALUES (?, ?, 'SELL', 'LONG', ?, ?, ?, ?, ?, ?)""",
-        (ticker, existing["asset_type"], shares, exec_price, slip * shares, commission, total_proceeds, pnl)
-    )
-    conn.commit()
-    conn.close()
-
-    return {
-        "success": True, "action": "SELL", "ticker": ticker,
-        "shares": shares, "price": round(exec_price, 4),
-        "slippage": round(slip, 4), "commission": round(commission, 2),
-        "total": round(total_proceeds, 2), "pnl": round(pnl, 2),
-        "remaining_cash": round(new_cash, 2)
-    }
 
 
 def short_sell(ticker, shares, price, asset_type="stock"):
-    """Open a short position. Margin is deducted from cash."""
+    """Open a short position. Margin is deducted from cash. Atomic."""
     if shares <= 0 or price <= 0:
         return {"error": "Invalid shares or price"}
 
     conn = get_db()
-    meta = _get_meta(conn)
-    cash = meta["cash"]
-    slippage_bps = meta["slippage_bps"]
-    comm_per_share = meta["commission_per_share"]
+    try:
+        with txn(conn):
+            meta = _get_meta(conn)
+            cash = meta["cash"]
+            slippage_bps = meta["slippage_bps"]
+            comm_per_share = meta["commission_per_share"]
 
-    slip = _calc_slippage(price, shares, slippage_bps, "SELL")
-    exec_price = price + slip  # worse price when selling (slippage)
-    commission = _calc_commission(shares, comm_per_share)
+            slip = _calc_slippage(price, shares, slippage_bps, "SELL")
+            exec_price = price + slip
+            commission = _calc_commission(shares, comm_per_share)
+            margin_req = shares * exec_price + commission
 
-    # Margin requirement: 100% of position value + commission
-    margin_req = shares * exec_price + commission
-    if margin_req > cash:
+            if margin_req > cash:
+                return {"error": f"Insufficient funds. Need ${margin_req:.2f}, have ${cash:.2f}"}
+
+            new_cash = cash - margin_req
+            new_margin = meta["margin_used"] + (shares * exec_price)
+            conn.execute(
+                "UPDATE portfolio_meta SET cash = ?, margin_used = ?, updated_at = datetime('now') "
+                "WHERE id = 1",
+                (new_cash, new_margin),
+            )
+
+            existing = conn.execute(
+                "SELECT * FROM positions WHERE ticker = ? AND side = 'SHORT'", (ticker,)
+            ).fetchone()
+            if existing:
+                old_shares = existing["shares"]
+                old_avg = existing["avg_cost"]
+                new_shares = old_shares + shares
+                new_avg = ((old_shares * old_avg) + (shares * exec_price)) / new_shares
+                conn.execute(
+                    "UPDATE positions SET shares = ?, avg_cost = ?, updated_at = datetime('now') "
+                    "WHERE ticker = ? AND side = 'SHORT'",
+                    (new_shares, new_avg, ticker),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO positions (ticker, asset_type, shares, avg_cost, side) "
+                    "VALUES (?, ?, ?, ?, 'SHORT')",
+                    (ticker, asset_type, shares, exec_price),
+                )
+
+            conn.execute(
+                "INSERT INTO transactions (ticker, asset_type, action, side, shares, price, "
+                "slippage, commission, total) "
+                "VALUES (?, ?, 'SHORT', 'SHORT', ?, ?, ?, ?, ?)",
+                (ticker, asset_type, shares, exec_price, abs(slip) * shares, commission, margin_req),
+            )
+        return {
+            "success": True, "action": "SHORT", "ticker": ticker,
+            "shares": shares, "price": round(exec_price, 4),
+            "margin_required": round(margin_req, 2),
+            "commission": round(commission, 2),
+        }
+    finally:
         conn.close()
-        return {"error": f"Insufficient funds. Need ${margin_req:.2f}, have ${cash:.2f}"}
-
-    # Deduct margin from cash (no proceeds added — paper trading model)
-    new_cash = cash - margin_req
-    new_margin = meta["margin_used"] + (shares * exec_price)
-
-    conn.execute("UPDATE portfolio_meta SET cash = ?, margin_used = ?, updated_at = datetime('now') WHERE id = 1",
-                 (new_cash, new_margin))
-
-    existing = conn.execute("SELECT * FROM positions WHERE ticker = ? AND side = 'SHORT'", (ticker,)).fetchone()
-    if existing:
-        old_shares = existing["shares"]
-        old_avg = existing["avg_cost"]
-        new_shares = old_shares + shares
-        new_avg = ((old_shares * old_avg) + (shares * exec_price)) / new_shares
-        conn.execute(
-            "UPDATE positions SET shares = ?, avg_cost = ?, updated_at = datetime('now') WHERE ticker = ? AND side = 'SHORT'",
-            (new_shares, new_avg, ticker)
-        )
-    else:
-        conn.execute(
-            "INSERT INTO positions (ticker, asset_type, shares, avg_cost, side) VALUES (?, ?, ?, ?, 'SHORT')",
-            (ticker, asset_type, shares, exec_price)
-        )
-
-    conn.execute(
-        """INSERT INTO transactions (ticker, asset_type, action, side, shares, price, slippage, commission, total)
-           VALUES (?, ?, 'SHORT', 'SHORT', ?, ?, ?, ?, ?)""",
-        (ticker, asset_type, shares, exec_price, abs(slip) * shares, commission, margin_req)
-    )
-    conn.commit()
-    conn.close()
-
-    return {
-        "success": True, "action": "SHORT", "ticker": ticker,
-        "shares": shares, "price": round(exec_price, 4),
-        "margin_required": round(margin_req, 2),
-        "commission": round(commission, 2)
-    }
 
 
 def cover_short(ticker, shares, price):
-    """Cover (buy back) a short position. Releases margin + P&L to cash."""
+    """Cover (buy back) a short position. Releases margin + P&L to cash. Atomic."""
     if shares <= 0 or price <= 0:
         return {"error": "Invalid shares or price"}
 
     conn = get_db()
-    meta = _get_meta(conn)
-    slippage_bps = meta["slippage_bps"]
-    comm_per_share = meta["commission_per_share"]
+    try:
+        with txn(conn):
+            meta = _get_meta(conn)
+            slippage_bps = meta["slippage_bps"]
+            comm_per_share = meta["commission_per_share"]
 
-    existing = conn.execute("SELECT * FROM positions WHERE ticker = ? AND side = 'SHORT'", (ticker,)).fetchone()
-    if not existing or existing["shares"] < shares:
+            existing = conn.execute(
+                "SELECT * FROM positions WHERE ticker = ? AND side = 'SHORT'", (ticker,)
+            ).fetchone()
+            if not existing or existing["shares"] < shares:
+                available = existing["shares"] if existing else 0
+                return {"error": f"No short position. Have {available} short shares."}
+
+            slip = _calc_slippage(price, shares, slippage_bps, "BUY")
+            exec_price = price + slip
+            commission = _calc_commission(shares, comm_per_share)
+
+            entry_value = shares * existing["avg_cost"]
+            cover_cost = shares * exec_price
+            pnl = entry_value - cover_cost - commission
+
+            cash = meta["cash"]
+            margin_release = entry_value
+            new_cash = cash + margin_release + pnl
+            new_margin = max(0, meta["margin_used"] - margin_release)
+
+            conn.execute(
+                "UPDATE portfolio_meta SET cash = ?, margin_used = ?, updated_at = datetime('now') "
+                "WHERE id = 1",
+                (new_cash, new_margin),
+            )
+
+            new_shares = existing["shares"] - shares
+            if new_shares <= 0:
+                conn.execute("DELETE FROM positions WHERE ticker = ? AND side = 'SHORT'", (ticker,))
+            else:
+                conn.execute(
+                    "UPDATE positions SET shares = ?, updated_at = datetime('now') "
+                    "WHERE ticker = ? AND side = 'SHORT'",
+                    (new_shares, ticker),
+                )
+
+            conn.execute(
+                "INSERT INTO transactions (ticker, asset_type, action, side, shares, price, "
+                "slippage, commission, total, pnl) "
+                "VALUES (?, ?, 'COVER', 'SHORT', ?, ?, ?, ?, ?, ?)",
+                (ticker, existing["asset_type"], shares, exec_price, abs(slip) * shares,
+                 commission, cover_cost + commission, pnl),
+            )
+        return {
+            "success": True, "action": "COVER", "ticker": ticker,
+            "shares": shares, "price": round(exec_price, 4),
+            "pnl": round(pnl, 2), "commission": round(commission, 2),
+            "remaining_cash": round(new_cash, 2),
+        }
+    finally:
         conn.close()
-        available = existing["shares"] if existing else 0
-        return {"error": f"No short position. Have {available} short shares."}
-
-    slip = _calc_slippage(price, shares, slippage_bps, "BUY")
-    exec_price = price + slip  # worse price when buying back (slippage)
-    commission = _calc_commission(shares, comm_per_share)
-
-    # P&L: profit when we shorted high and cover low
-    entry_value = shares * existing["avg_cost"]
-    cover_cost = shares * exec_price
-    pnl = entry_value - cover_cost - commission  # short profit when price drops
-
-    # Release margin and return to cash with P&L
-    cash = meta["cash"]
-    margin_release = entry_value  # we held 100% of entry value as margin
-    new_cash = cash + margin_release + pnl  # margin back + profit/loss
-    new_margin = max(0, meta["margin_used"] - margin_release)
-
-    conn.execute("UPDATE portfolio_meta SET cash = ?, margin_used = ?, updated_at = datetime('now') WHERE id = 1",
-                 (new_cash, new_margin))
-
-    new_shares = existing["shares"] - shares
-    if new_shares <= 0:
-        conn.execute("DELETE FROM positions WHERE ticker = ? AND side = 'SHORT'", (ticker,))
-    else:
-        conn.execute(
-            "UPDATE positions SET shares = ?, updated_at = datetime('now') WHERE ticker = ? AND side = 'SHORT'",
-            (new_shares, ticker)
-        )
-
-    conn.execute(
-        """INSERT INTO transactions (ticker, asset_type, action, side, shares, price, slippage, commission, total, pnl)
-           VALUES (?, ?, 'COVER', 'SHORT', ?, ?, ?, ?, ?, ?)""",
-        (ticker, existing["asset_type"], shares, exec_price, abs(slip) * shares, commission, cover_cost + commission, pnl)
-    )
-    conn.commit()
-    conn.close()
-
-    return {
-        "success": True, "action": "COVER", "ticker": ticker,
-        "shares": shares, "price": round(exec_price, 4),
-        "pnl": round(pnl, 2), "commission": round(commission, 2),
-        "remaining_cash": round(new_cash, 2)
-    }
 
 
 # ── Pending Orders (Limit / Stop) ────────────────────────
@@ -715,18 +770,20 @@ def save_daily_snapshot(total_value, cash, positions_value):
 
 
 def reset_portfolio():
-    """Reset portfolio to initial state — clears everything."""
+    """Reset portfolio to initial state — clears everything. Atomic."""
     conn = get_db()
-    conn.execute("DELETE FROM portfolio_meta")
-    conn.execute("INSERT INTO portfolio_meta (id, cash) VALUES (1, ?)", (INITIAL_CASH,))
-    conn.execute("DELETE FROM positions")
-    conn.execute("DELETE FROM transactions")
-    conn.execute("DELETE FROM pending_orders")
-    conn.execute("DELETE FROM equity_curve")
-    conn.execute("DELETE FROM portfolio_snapshots")
-    conn.commit()
-    conn.close()
-    return {"success": True, "message": "Portfolio reset to $100,000"}
+    try:
+        with txn(conn):
+            conn.execute("DELETE FROM portfolio_meta")
+            conn.execute("INSERT INTO portfolio_meta (id, cash) VALUES (1, ?)", (INITIAL_CASH,))
+            conn.execute("DELETE FROM positions")
+            conn.execute("DELETE FROM transactions")
+            conn.execute("DELETE FROM pending_orders")
+            conn.execute("DELETE FROM equity_curve")
+            conn.execute("DELETE FROM portfolio_snapshots")
+        return {"success": True, "message": "Portfolio reset to $100,000"}
+    finally:
+        conn.close()
 
 
 def update_settings(slippage_bps=None, commission_per_share=None):

@@ -9,8 +9,13 @@
         content="Professional multi-asset analytics: stocks, futures, options, currencies. DCF, Monte Carlo, AI insights, and live charting.">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;450;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+        rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css">
+    <!-- KLineChart: main price chart (candles, indicators, live feed) -->
+    <script src="https://unpkg.com/klinecharts@9.8.10/dist/umd/klinecharts.min.js"></script>
+    <!-- Lightweight Charts: secondary charts (Monte Carlo, payoff, equity curve) -->
     <script src="https://unpkg.com/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
 </head>
@@ -30,51 +35,17 @@
                 <h1 class="welcome-title">FinanceIQ</h1>
                 <span class="badge-version">v5.2</span>
             </div>
-            <p class="welcome-subtitle">Multi-Asset Intelligence Platform</p>
+            <p class="welcome-subtitle">Equity Research Workstation</p>
             <p class="welcome-desc">
-                Stocks · Futures · Options · Currencies<br>
-                AI-powered analysis, live charts, DCF valuation, Monte Carlo forecasting, and institutional-grade
-                analytics.
+                Fundamentals, valuation, and risk for any ticker — statements, DCF, peer comps,
+                consensus, and live charting in one workspace.
             </p>
 
-            <div class="welcome-features">
-                <div class="wf-card">
-                    <i data-lucide="candlestick-chart" class="wf-lucide"></i>
-                    <h3>Live Charts</h3>
-                    <p>Real-time candlestick charts with EMA, SMA, Bollinger, and drawing tools.</p>
-                </div>
-                <div class="wf-card">
-                    <i data-lucide="calculator" class="wf-lucide"></i>
-                    <h3>DCF Valuation</h3>
-                    <p>Intrinsic value via discounted cash flows, WACC, and terminal growth.</p>
-                </div>
-                <div class="wf-card">
-                    <i data-lucide="brain" class="wf-lucide"></i>
-                    <h3>AI Analyst</h3>
-                    <p>LLM-powered research synthesizing technicals, fundamentals, and sentiment.</p>
-                </div>
-                <div class="wf-card">
-                    <i data-lucide="trending-up" class="wf-lucide"></i>
-                    <h3>Monte Carlo</h3>
-                    <p>1,000-path probabilistic simulation with percentile bands.</p>
-                </div>
-                <div class="wf-card">
-                    <i data-lucide="target" class="wf-lucide"></i>
-                    <h3>Analyst Consensus</h3>
-                    <p>Live Wall Street ratings, price targets, and insider activity.</p>
-                </div>
-                <div class="wf-card">
-                    <i data-lucide="globe" class="wf-lucide"></i>
-                    <h3>Macro Intelligence</h3>
-                    <p>FRED indicators, sector heatmaps, correlation and peer analysis.</p>
-                </div>
-            </div>
-
             <button class="welcome-cta" id="letsBeginBtn">
-                <i data-lucide="arrow-right" style="width:20px;height:20px;"></i>
-                <span>Get Started</span>
+                <span>Enter Terminal</span>
+                <i data-lucide="arrow-right" style="width:16px;height:16px;"></i>
             </button>
-            <p class="welcome-footer">FMP · Finnhub · FRED · Alpha Vantage · Ollama AI</p>
+            <p class="welcome-footer">FMP · Finnhub · FRED · Alpha Vantage · Local AI</p>
         </div>
     </div>
 
@@ -85,43 +56,43 @@
 
         <!-- ── SIDEBAR ─────────────────────────────────── -->
         <aside class="sidebar" id="sidebar">
-            <div class="sidebar-brand">
+            <div class="sidebar-brand" style="cursor:pointer;" title="Return to Market Pulse">
                 <i data-lucide="bar-chart-3" class="brand-icon"></i>
                 <span class="brand-text">FinanceIQ</span>
                 <span class="badge-version badge-sm">v5.2</span>
             </div>
 
             <nav class="sidebar-nav">
-                <div class="nav-group-label">Analysis</div>
+                <div class="nav-group-label">Research</div>
                 <button class="nav-item active" data-tab="overview" data-asset="stocks,futures,options,currencies">
                     <i data-lucide="layout-dashboard"></i>
                     <span>Overview</span>
-                </button>
-                <button class="nav-item" data-tab="technical" data-asset="stocks,futures,currencies">
-                    <i data-lucide="activity"></i>
-                    <span>Technical</span>
                 </button>
                 <button class="nav-item" data-tab="fundamentals" data-asset="stocks">
                     <i data-lucide="landmark"></i>
                     <span>Fundamentals</span>
                 </button>
-                <button class="nav-item" data-tab="sentiment" data-asset="stocks,futures,options,currencies">
-                    <i data-lucide="heart-pulse"></i>
-                    <span>Sentiment</span>
+                <button class="nav-item" data-tab="technical" data-asset="stocks,futures,currencies">
+                    <i data-lucide="activity"></i>
+                    <span>Technical</span>
                 </button>
-                <button class="nav-item" data-tab="options" data-asset="options">
-                    <i data-lucide="layers"></i>
-                    <span>Options</span>
-                </button>
-
-                <div class="nav-group-label">Research</div>
                 <button class="nav-item" data-tab="intelligence" data-asset="stocks,futures,options,currencies">
                     <i data-lucide="sparkles"></i>
                     <span>Intelligence</span>
                 </button>
+
+                <div class="nav-group-label">Markets</div>
+                <button class="nav-item" data-tab="sentiment" data-asset="stocks,futures,options,currencies">
+                    <i data-lucide="heart-pulse"></i>
+                    <span>Sentiment</span>
+                </button>
                 <button class="nav-item" data-tab="macro" data-asset="stocks,futures">
                     <i data-lucide="globe-2"></i>
                     <span>Macro</span>
+                </button>
+                <button class="nav-item" data-tab="options" data-asset="options">
+                    <i data-lucide="layers"></i>
+                    <span>Options</span>
                 </button>
 
                 <div class="nav-group-label">Trading</div>
@@ -167,6 +138,9 @@
                         <button class="asset-btn" data-asset="currencies">
                             <i data-lucide="coins"></i> Currencies
                         </button>
+                        <button class="asset-btn" data-asset="crypto">
+                            <i data-lucide="bitcoin"></i> Crypto
+                        </button>
                     </div>
 
                     <!-- Search Input -->
@@ -177,31 +151,11 @@
                                 autocomplete="off">
                             <div class="dropdown" id="dropdown"></div>
                         </div>
-                        <select id="timeframeSelect" class="select-control">
-                            <option value="1Y">1 Year</option>
-                            <option value="6M">6 Months</option>
-                            <option value="3M">3 Months</option>
-                            <option value="1M">1 Month</option>
-                            <option value="5Y">5 Years</option>
-                            <option value="custom">Custom</option>
-                        </select>
-                        <select id="periodSelect" class="select-control">
-                            <option value="yearly">Annual</option>
-                            <option value="quarterly">Quarterly</option>
-                        </select>
-                        <select id="currencySelect" class="select-control">
-                            <option value="GBP">£ GBP</option>
-                            <option value="USD">$ USD</option>
-                            <option value="INR">₹ INR</option>
-                        </select>
+
                         <button id="analyzeBtn" class="btn-primary">
                             <i data-lucide="zap" style="width:16px;height:16px;"></i>
                             Analyze
                         </button>
-                    </div>
-                    <div class="custom-dates" id="customDates" style="display:none;">
-                        <label>From <input type="date" id="startDate"></label>
-                        <label>To <input type="date" id="endDate"></label>
                     </div>
                 </div>
             </header>
@@ -302,75 +256,83 @@
                     </div>
                 </div>
 
-                <div class="results">
-                    <div class="card card-full">
-                        <div class="card-header">
-                            <div class="card-title">
-                                <i data-lucide="candlestick-chart"></i>
-                                Interactive Price Chart
+                <div id="analysisResults" style="display:none">
+                    <div class="results">
+                        <div class="card card-full price-chart-card">
+                            <div class="card-header">
+                                <div class="card-title">
+                                    <i data-lucide="candlestick-chart"></i>
+                                    Price Chart
+                                    <span class="feed-badge" id="feedBadge" title="Data source"></span>
+                                </div>
+                                <div class="chart-head-right">
+                                    <div class="interval-selector" id="intervalSelector">
+                                        <button class="iv-btn" data-iv="15m">15m</button>
+                                        <button class="iv-btn" data-iv="1h">1H</button>
+                                        <button class="iv-btn" data-iv="4h">4H</button>
+                                        <button class="iv-btn active" data-iv="1d">1D</button>
+                                        <button class="iv-btn" data-iv="1w">1W</button>
+                                    </div>
+                                    <span class="info-icon"
+                                        data-tooltip="Candlestick chart with volume. Crypto streams real-time from Binance; stocks, FX and futures are ~15-min delayed (Yahoo). Toggle indicators below.">
+                                        <i data-lucide="info" style="width:14px;height:14px;"></i>
+                                    </span>
+                                </div>
                             </div>
-                            <span class="info-icon"
-                                data-tooltip="Candlestick chart with volume. Toggle overlays below to add EMA, SMA, Bollinger Bands, and Fibonacci levels.">
-                                <i data-lucide="info" style="width:14px;height:14px;"></i>
-                            </span>
-                        </div>
-                        <div class="chart-controls" id="chartControls" style="display:none">
-                            <label class="chart-toggle"><input type="checkbox" id="togEma5"> EMA 5</label>
-                            <label class="chart-toggle"><input type="checkbox" id="togEma10"> EMA 10</label>
-                            <label class="chart-toggle"><input type="checkbox" id="togEma20"> EMA 20</label>
-                            <label class="chart-toggle"><input type="checkbox" id="togSma200"> SMA 200</label>
-                            <label class="chart-toggle"><input type="checkbox" id="togBb"> Bollinger</label>
-                            <label class="chart-toggle"><input type="checkbox" id="togFib"> Fibonacci</label>
-                            <div class="custom-ema">
-                                <input type="number" id="customEmaPeriod" placeholder="Custom EMA" min="2" max="500">
-                                <button class="btn-sm" id="addCustomEma">Add</button>
+                            <div class="chart-controls" id="chartControls" style="display:none">
+                                <label class="chart-toggle"><input type="checkbox" id="indMA" checked> MA</label>
+                                <label class="chart-toggle"><input type="checkbox" id="indEMA"> EMA</label>
+                                <label class="chart-toggle"><input type="checkbox" id="indBOLL"> Bollinger</label>
+                                <label class="chart-toggle"><input type="checkbox" id="indVOL" checked> Volume</label>
+                                <label class="chart-toggle"><input type="checkbox" id="indMACD"> MACD</label>
+                                <label class="chart-toggle"><input type="checkbox" id="indRSI"> RSI</label>
+                                <label class="chart-toggle"><input type="checkbox" id="indKDJ"> KDJ</label>
                             </div>
+                            <div id="chartContainer" style="width:100%;height:480px;"></div>
                         </div>
-                        <div id="chartContainer"
-                            style="width:100%;height:420px;border-radius:var(--radius);overflow:hidden;"></div>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">
-                            <div class="card-title">
-                                <i data-lucide="gauge"></i>
-                                Key Metrics
+                        <div class="card">
+                            <div class="card-header">
+                                <div class="card-title">
+                                    <i data-lucide="gauge"></i>
+                                    Key Metrics
+                                </div>
+                                <span class="info-icon"
+                                    data-tooltip="Essential price and valuation metrics. RSI above 70 = overbought, below 30 = oversold.">
+                                    <i data-lucide="info" style="width:14px;height:14px;"></i>
+                                </span>
                             </div>
-                            <span class="info-icon"
-                                data-tooltip="Essential price and valuation metrics. RSI above 70 = overbought, below 30 = oversold.">
-                                <i data-lucide="info" style="width:14px;height:14px;"></i>
-                            </span>
+                            <div class="data-grid" id="keyMetrics"></div>
                         </div>
-                        <div class="data-grid" id="keyMetrics"></div>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">
-                            <div class="card-title">
-                                <i data-lucide="zap"></i>
-                                Quick Signal
+                        <div class="card">
+                            <div class="card-header">
+                                <div class="card-title">
+                                    <i data-lucide="zap"></i>
+                                    Quick Signal
+                                </div>
+                                <span class="info-icon"
+                                    data-tooltip="Algorithmic signal based on RSI, MACD, and moving average crossovers.">
+                                    <i data-lucide="info" style="width:14px;height:14px;"></i>
+                                </span>
                             </div>
-                            <span class="info-icon"
-                                data-tooltip="Algorithmic signal based on RSI, MACD, and moving average crossovers.">
-                                <i data-lucide="info" style="width:14px;height:14px;"></i>
-                            </span>
+                            <div id="quickSignal"></div>
                         </div>
-                        <div id="quickSignal"></div>
                     </div>
                 </div>
-            </div>
+            </div> <!-- /analysisResults -->
 
             <!-- ═══════════════════════════════════════════ -->
             <!-- TAB: TECHNICAL                              -->
             <!-- ═══════════════════════════════════════════ -->
             <div class="tab-page" id="page-technical">
                 <div class="results">
-                    <div class="card card-full">
+                    <div class="card card-full card-tooltips">
                         <div class="card-header">
                             <div class="card-title">
                                 <i data-lucide="activity"></i>
                                 Technical Indicators
                             </div>
                             <span class="info-icon"
-                                data-tooltip="RSI (14-period), MACD trend direction, Bollinger Bands volatility measure.">
+                                data-tooltip="Hover any indicator below to learn how to read it.">
                                 <i data-lucide="info" style="width:14px;height:14px;"></i>
                             </span>
                         </div>
@@ -411,19 +373,6 @@
             <!-- ═══════════════════════════════════════════ -->
             <div class="tab-page" id="page-fundamentals">
                 <div class="results">
-                    <div class="card card-full">
-                        <div class="card-header">
-                            <div class="card-title">
-                                <i data-lucide="landmark"></i>
-                                DCF Intrinsic Valuation
-                            </div>
-                            <span class="info-icon"
-                                data-tooltip="DCF projects future FCF, discounts by WACC, and derives intrinsic value. Intrinsic > price = undervalued.">
-                                <i data-lucide="info" style="width:14px;height:14px;"></i>
-                            </span>
-                        </div>
-                        <div id="dcfValuation"></div>
-                    </div>
                     <div class="card">
                         <div class="card-header">
                             <div class="card-title">
@@ -581,12 +530,14 @@
                             </span>
                         </div>
                         <div class="mc-band-controls" id="mcBandControls">
-                            <label class="chart-toggle"><input type="checkbox" id="togP90" checked> P90 (Bull)</label>
+                            <label class="chart-toggle"><input type="checkbox" id="togP90" checked> P90
+                                (Bull)</label>
                             <label class="chart-toggle"><input type="checkbox" id="togP75" checked> P75</label>
                             <label class="chart-toggle"><input type="checkbox" id="togP50" checked> P50
                                 (Median)</label>
                             <label class="chart-toggle"><input type="checkbox" id="togP25" checked> P25</label>
-                            <label class="chart-toggle"><input type="checkbox" id="togP10" checked> P10 (Bear)</label>
+                            <label class="chart-toggle"><input type="checkbox" id="togP10" checked> P10
+                                (Bear)</label>
                         </div>
                         <div id="monteCarloChart"
                             style="width:100%;height:340px;border-radius:var(--radius);overflow:hidden;"></div>

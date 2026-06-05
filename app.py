@@ -1,8 +1,13 @@
 """
-Financial Analysis Web App — Backend (Flask) v3
-Features: Interactive chart overlays, always-fetch financials, indicator tooltips, competitor analysis
+Financial Analysis Web App — Backend (Flask)
+
+Hardened build:
+  * Configuration is fully env-driven (see .env.example).
+  * AI backend (Ollama → Gemini) is configurable; misconfiguration is logged loudly at startup.
+  * Per-IP rate limiting on hot endpoints (autocomplete, full analysis, AI).
+  * Errors are sanitized — stack traces never leak to clients unless FLASK_ENV=development.
 """
-from flask import Flask, render_template, request, jsonify, send_file, Response
+from flask import Flask, render_template, request, send_file, Response
 from financetoolkit import Toolkit
 import requests as http_requests  # for Ollama + external API calls
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
@@ -13,11 +18,82 @@ import openpyxl
 from io import BytesIO
 from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-import json, traceback, time, math, os
+import json, traceback, time, math, os, logging, uuid
 from dotenv import load_dotenv
+
 load_dotenv()
 
+# ── Logging (use logging instead of bare print so output is filterable) ──
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
+log = logging.getLogger("financeiq")
+
 app = Flask(__name__)
+IS_DEV = os.environ.get("FLASK_ENV", "production").lower() == "development"
+
+# ── Rate limiting (per IP) ──
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+
+    limiter = Limiter(
+        get_remote_address,
+        app=app,
+        default_limits=[os.environ.get("RATE_LIMIT_DEFAULT", "120/minute")],
+        storage_uri="memory://",
+        headers_enabled=True,
+    )
+except Exception as exc:  # pragma: no cover - flask_limiter is required
+    log.warning("flask-limiter unavailable, rate limiting disabled: %s", exc)
+
+    class _NoopLimiter:
+        def limit(self, *_args, **_kwargs):
+            def decorator(fn):
+                return fn
+            return decorator
+
+    limiter = _NoopLimiter()
+
+RATE_LIMIT_SUGGEST = os.environ.get("RATE_LIMIT_SUGGEST", "30/minute")
+RATE_LIMIT_ANALYZE = os.environ.get("RATE_LIMIT_ANALYZE", "10/minute")
+RATE_LIMIT_AI = os.environ.get("RATE_LIMIT_AI", "5/minute")
+RATE_LIMIT_HEAVY = os.environ.get("RATE_LIMIT_HEAVY", "20/minute")
+
+
+def fail(message, status=500, *, code=None, log_exc=False):
+    """Return a sanitized error response.
+
+    Stack traces and raw exception strings are NEVER sent to the client unless
+    FLASK_ENV=development. A short request id is included so server logs can be
+    correlated with what the user saw.
+    """
+    req_id = uuid.uuid4().hex[:8]
+    if log_exc:
+        log.exception("[req=%s] %s", req_id, message)
+    else:
+        log.error("[req=%s] %s", req_id, message)
+    body = {"error": message if IS_DEV else "Request failed.", "request_id": req_id}
+    if code:
+        body["code"] = code
+    if IS_DEV:
+        body["detail"] = message
+    return safe_jsonify(body), status
+
+
+def validate_ticker(raw, *, allow_unknown=True):
+    """Sanitize a ticker string. Returns the uppercased ticker or None if invalid."""
+    if raw is None:
+        return None
+    t = str(raw).upper().strip()
+    if not t or len(t) > 20:
+        return None
+    # Only allow alphanumerics and the symbols Yahoo Finance uses for futures / FX / indices
+    for ch in t:
+        if not (ch.isalnum() or ch in ".=^-"):
+            return None
+    return t
 
 class SafeJSONEncoder(json.JSONEncoder):
     """JSON encoder that handles NaN, Inf, numpy types, pandas types."""
@@ -49,33 +125,102 @@ FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "")
 FRED_KEY = os.environ.get("FRED_API_KEY", "")
 
 # ── AI Backend: Ollama (local) with Gemini fallback ──────
-OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "llama3.1"  # 8B params, runs well on 3050 GPU
+# All fully overridable via .env so the project actually works on someone else's box.
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
+try:
+    OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "120"))
+except (TypeError, ValueError):
+    OLLAMA_TIMEOUT = 120
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 
-def call_ai(prompt):
-    """Try Ollama local first, fall back to Gemini API if unavailable."""
-    # Try Ollama (local, free, instant)
+# Probed once at startup; updated on every call so we don't hammer dead endpoints.
+_AI_STATE = {"ollama_ok": None, "gemini_ok": None, "last_probe_ts": 0}
+
+
+def _ollama_probe(timeout=2):
+    """Return True if the Ollama server answers /api/tags."""
     try:
-        r = http_requests.post(f"{OLLAMA_URL}/api/generate", json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.7, "num_predict": 2048}
-        }, timeout=120)
-        if r.status_code == 200:
-            return r.json().get("response", "")
-    except Exception as e:
-        print(f"Ollama unavailable: {e}")
+        r = http_requests.get(f"{OLLAMA_URL}/api/tags", timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
 
-    # Fallback: Gemini API
+
+def call_ai(prompt, *, max_tokens=2048, temperature=0.7):
+    """Try Ollama local first, fall back to Gemini API if unavailable.
+
+    Returns a string on success or None if both providers fail / are unconfigured.
+    """
+    # 1) Try Ollama only if a recent probe says it's reachable (avoids 120s timeouts).
+    if _AI_STATE["ollama_ok"] is not False:
+        try:
+            r = http_requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": temperature, "num_predict": max_tokens},
+                },
+                timeout=OLLAMA_TIMEOUT,
+            )
+            if r.status_code == 200:
+                _AI_STATE["ollama_ok"] = True
+                return r.json().get("response", "")
+            log.warning("Ollama returned %s; falling back to Gemini", r.status_code)
+            _AI_STATE["ollama_ok"] = False
+        except Exception as exc:
+            log.info("Ollama unreachable (%s); falling back to Gemini", exc)
+            _AI_STATE["ollama_ok"] = False
+
+    # 2) Fallback: Gemini.
+    if not GEMINI_API_KEY:
+        log.error("AI request failed: Ollama unreachable and GEMINI_API_KEY is empty")
+        _AI_STATE["gemini_ok"] = False
+        return None
     try:
         from google import genai
         client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+        _AI_STATE["gemini_ok"] = True
         return response.text
-    except Exception as e:
-        print(f"Gemini fallback also failed: {e}")
+    except Exception as exc:
+        log.error("Gemini fallback failed: %s", exc)
+        _AI_STATE["gemini_ok"] = False
         return None
+
+
+def _startup_health_check():
+    """Log clear warnings when required API keys / AI providers are missing."""
+    log.info("─" * 60)
+    log.info("FinanceIQ startup health check")
+    log.info("─" * 60)
+    keys = [
+        ("FMP_API_KEY", FMP_API_KEY, "required for fundamentals/ratios"),
+        ("FINNHUB_API_KEY", FINNHUB_KEY, "analyst, insider, earnings"),
+        ("FRED_API_KEY", FRED_KEY, "macroeconomic indicators"),
+        ("ALPHA_VANTAGE_KEY", ALPHA_VANTAGE_KEY, "sector heatmap / FX"),
+    ]
+    for name, value, purpose in keys:
+        if value:
+            log.info("  [ok]   %s set (%s)", name, purpose)
+        else:
+            log.warning("  [warn] %s missing — %s will be degraded", name, purpose)
+
+    # AI probe
+    _AI_STATE["ollama_ok"] = _ollama_probe()
+    if _AI_STATE["ollama_ok"]:
+        log.info("  [ok]   Ollama reachable at %s (model=%s)", OLLAMA_URL, OLLAMA_MODEL)
+    elif GEMINI_API_KEY:
+        log.info("  [ok]   Ollama unreachable; Gemini fallback configured (model=%s)", GEMINI_MODEL)
+    else:
+        log.error(
+            "  [FAIL] No AI backend! Start Ollama at %s OR set GEMINI_API_KEY. "
+            "/api/ai will return 503 until fixed.",
+            OLLAMA_URL,
+        )
+    log.info("─" * 60)
 
 # ── TICKER DATABASE ──────────────────────────────────────
 TICKER_DB = [
@@ -166,7 +311,30 @@ TICKER_DB = [
     ("^FTSE","FTSE 100"),("^N225","Nikkei 225"),("^GDAXI","DAX"),("^HSI","Hang Seng"),
     ("000001.SS","Shanghai Composite"),("^AXJO","ASX 200"),("^FCHI","CAC 40"),
     ("^RUT","Russell 2000"),("^VIX","CBOE Volatility Index"),
+    # ── Crypto (real-time via Binance) ──
+    ("BTC-USD","Bitcoin"),("ETH-USD","Ethereum"),("SOL-USD","Solana"),
+    ("BNB-USD","BNB"),("XRP-USD","XRP"),("ADA-USD","Cardano"),
+    ("DOGE-USD","Dogecoin"),("AVAX-USD","Avalanche"),("LINK-USD","Chainlink"),
+    ("DOT-USD","Polkadot"),("LTC-USD","Litecoin"),("TRX-USD","TRON"),
+    ("MATIC-USD","Polygon"),("ATOM-USD","Cosmos"),("UNI-USD","Uniswap"),
+    ("BCH-USD","Bitcoin Cash"),("NEAR-USD","NEAR Protocol"),("APT-USD","Aptos"),
+    ("ARB-USD","Arbitrum"),("FIL-USD","Filecoin"),
 ]
+
+# ── CRYPTO → Binance symbol map (real-time, keyless public data) ──────
+CRYPTO_BINANCE = {
+    "BTC-USD": "BTCUSDT", "ETH-USD": "ETHUSDT", "SOL-USD": "SOLUSDT",
+    "BNB-USD": "BNBUSDT", "XRP-USD": "XRPUSDT", "ADA-USD": "ADAUSDT",
+    "DOGE-USD": "DOGEUSDT", "AVAX-USD": "AVAXUSDT", "LINK-USD": "LINKUSDT",
+    "DOT-USD": "DOTUSDT", "LTC-USD": "LTCUSDT", "TRX-USD": "TRXUSDT",
+    "MATIC-USD": "MATICUSDT", "ATOM-USD": "ATOMUSDT", "UNI-USD": "UNIUSDT",
+    "BCH-USD": "BCHUSDT", "NEAR-USD": "NEARUSDT", "APT-USD": "APTUSDT",
+    "ARB-USD": "ARBUSDT", "FIL-USD": "FILUSDT",
+}
+
+
+def is_crypto(ticker):
+    return (ticker or "").upper() in CRYPTO_BINANCE
 
 # ── SECTOR PEER GROUPS ───────────────────────────────────
 SECTOR_PEERS = {
@@ -185,6 +353,26 @@ def get_peers(ticker):
         if t in tickers:
             return [p for p in tickers if p != t][:5], sector
     return [], "unknown"
+
+def _last_valid(series):
+    """Last non-NaN value of a pandas Series.
+
+    FMP/financetoolkit append a trailing partial/future period column that is
+    NaN for companies whose latest fiscal year has not been filed yet (e.g.
+    AAPL's 2026). A naive ``.iloc[-1]`` grabs that NaN and the value renders as
+    'N/A'. This walks back to the most recent reported figure instead.
+    """
+    try:
+        s = series.dropna()
+        if len(s):
+            return s.iloc[-1]
+    except Exception:
+        pass
+    try:
+        return series.iloc[-1] if len(series) else None
+    except Exception:
+        return None
+
 
 def safe_val(val):
     if val is None: return None
@@ -230,7 +418,7 @@ def get_fin_val(df, ticker, row_label):
             elif ticker in df.columns.get_level_values(0):
                 df = df.xs(ticker, level=0, axis=1)
         if row_label in df.index:
-            return safe_num(df.loc[row_label].iloc[-1])
+            return safe_num(_last_valid(df.loc[row_label]))
     except: pass
     return "N/A"
 
@@ -241,6 +429,7 @@ def index():
 
 # ── Route: Ticker Suggestions ────────────────────────────
 @app.route("/api/suggest", methods=["GET"])
+@limiter.limit(RATE_LIMIT_SUGGEST)
 def suggest():
     q = request.args.get("q", "").upper().strip()
     asset_type = request.args.get("asset_type", "").lower().strip()
@@ -248,14 +437,18 @@ def suggest():
 
     def matches_asset_type(ticker):
         if not asset_type: return True
+        if asset_type == "crypto":
+            return ticker in CRYPTO_BINANCE
         if asset_type == "stocks":
-            return not ticker.endswith("=F") and not ticker.endswith("=X")
+            return (not ticker.endswith("=F") and not ticker.endswith("=X")
+                    and ticker not in CRYPTO_BINANCE)
         elif asset_type == "futures":
             return ticker.endswith("=F")
         elif asset_type == "currencies":
             return ticker.endswith("=X")
         elif asset_type == "options":
-            return not ticker.endswith("=F") and not ticker.endswith("=X") and not ticker.startswith("^")
+            return (not ticker.endswith("=F") and not ticker.endswith("=X")
+                    and not ticker.startswith("^") and ticker not in CRYPTO_BINANCE)
         return True
 
     results = []
@@ -275,12 +468,83 @@ def suggest():
     results.sort(key=lambda x: -x["score"])
     return safe_jsonify(results[:10])
 
+# ── Route: OHLC candles for the chart ────────────────────
+# Crypto  → Binance public data (real-time, keyless).
+# Else    → yfinance (delayed ~15 min).
+# Returns KLineChart-native bars: {timestamp(ms), open, high, low, close, volume}.
+_BINANCE_REST = "https://data-api.binance.vision/api/v3/klines"
+_KLINE_INTERVALS = {"1d", "1h", "4h", "15m", "1w"}
+# yfinance (period, interval) per chart interval
+_YF_RANGE = {
+    "1d": ("1y", "1d"), "1w": ("5y", "1wk"),
+    "1h": ("1mo", "1h"), "4h": ("3mo", "1h"), "15m": ("5d", "15m"),
+}
+
+
+@app.route("/api/klines", methods=["GET"])
+@limiter.limit(RATE_LIMIT_HEAVY)
+def klines():
+    symbol = validate_ticker(request.args.get("symbol", ""))
+    interval = request.args.get("interval", "1d")
+    if interval not in _KLINE_INTERVALS:
+        interval = "1d"
+    if not symbol:
+        return fail("Invalid symbol", status=400, code="bad_symbol")
+
+    # ── Crypto: real-time Binance ──
+    if symbol in CRYPTO_BINANCE:
+        try:
+            r = http_requests.get(
+                _BINANCE_REST,
+                params={"symbol": CRYPTO_BINANCE[symbol], "interval": interval, "limit": 500},
+                timeout=10,
+            )
+            arr = r.json()
+            bars = [{
+                "timestamp": int(k[0]),
+                "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]), "volume": float(k[5]),
+            } for k in arr]
+            return safe_jsonify({
+                "symbol": symbol, "source": "binance", "realtime": True,
+                "binance_symbol": CRYPTO_BINANCE[symbol], "bars": bars,
+            })
+        except Exception as e:
+            return fail(f"binance klines failed: {e}", status=502, log_exc=True)
+
+    # ── Everything else: delayed yfinance ──
+    try:
+        import yfinance as yf
+        period, yf_interval = _YF_RANGE.get(interval, ("1y", "1d"))
+        hist = yf.Ticker(symbol).history(period=period, interval=yf_interval)
+        if hist is None or hist.empty:
+            return safe_jsonify({"symbol": symbol, "source": "yahoo", "realtime": False, "bars": []})
+        bars = []
+        for idx, row in hist.iterrows():
+            try:
+                bars.append({
+                    "timestamp": int(idx.timestamp() * 1000),
+                    "open": float(row["Open"]), "high": float(row["High"]),
+                    "low": float(row["Low"]), "close": float(row["Close"]),
+                    "volume": float(row.get("Volume", 0) or 0),
+                })
+            except (ValueError, TypeError):
+                continue
+        return safe_jsonify({"symbol": symbol, "source": "yahoo", "realtime": False, "bars": bars})
+    except Exception as e:
+        return fail(f"yfinance klines failed: {e}", status=502, log_exc=True)
+
 # ── Route: Full Analysis ─────────────────────────────────
 @app.route("/api/analyze", methods=["POST"])
+@limiter.limit(RATE_LIMIT_ANALYZE)
 def analyze():
-    data = request.json
-    ticker = data.get("ticker", "AAPL").upper().strip()
+    data = request.get_json(silent=True) or {}
+    ticker = validate_ticker(data.get("ticker", "AAPL"))
+    if not ticker:
+        return fail("Invalid ticker", status=400, code="bad_ticker")
     period = data.get("period", "yearly")
+    if period not in ("yearly", "quarterly"):
+        period = "yearly"
     start_date = data.get("start_date", "")
     end_date = data.get("end_date", "")
 
@@ -337,8 +601,12 @@ def analyze():
         delta = close.diff()
         gain = delta.where(delta > 0, 0).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-        rs = gain / loss
-        rsi = safe_num(100 - (100 / (1 + rs)).iloc[-1])
+        # Guard against div-by-zero: when loss==0 (strong uptrend), RSI is 100; when both 0, RSI is 50.
+        rs = gain / loss.replace(0, np.nan)
+        rsi_series = 100 - (100 / (1 + rs))
+        rsi_series = rsi_series.where(loss > 0, 100)        # loss==0  → RSI=100
+        rsi_series = rsi_series.where(~((gain == 0) & (loss == 0)), 50)  # both 0 → RSI=50
+        rsi = safe_num(rsi_series.iloc[-1])
 
         ema5 = safe_num(close.ewm(span=5).mean().iloc[-1])
         ema10 = safe_num(close.ewm(span=10).mean().iloc[-1])
@@ -459,8 +727,7 @@ def analyze():
         })
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(f"analyze failed: {e}", status=500, log_exc=True)
 
 # ── Route: Competitor Analysis ───────────────────────────
 def get_multi_val(df, ticker, metric):
@@ -469,11 +736,10 @@ def get_multi_val(df, ticker, metric):
     try:
         if isinstance(df.index, pd.MultiIndex):
             if (ticker, metric) in df.index:
-                row = df.loc[(ticker, metric)]
-                return safe_num(row.iloc[-1])
+                return safe_num(_last_valid(df.loc[(ticker, metric)]))
         else:
             if metric in df.index:
-                return safe_num(df.loc[metric].iloc[-1])
+                return safe_num(_last_valid(df.loc[metric]))
     except: pass
     return "N/A"
 
@@ -507,14 +773,18 @@ def competitors():
 
         return safe_jsonify({"sector": sector, "peers": result})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"sector": sector, "peers": [], "error": str(e)})
+        log.exception("competitors failure")
+        # Return 200 with empty peers + generic message so the UI degrades gracefully.
+        return safe_jsonify({"sector": sector, "peers": [], "error": "Peer data unavailable."})
 
 # ── Route: News ──────────────────────────────────────────
 @app.route("/api/news", methods=["POST"])
+@limiter.limit(RATE_LIMIT_HEAVY)
 def news():
-    data = request.json
-    ticker = data.get("ticker", "AAPL").upper().strip()
+    data = request.get_json(silent=True) or {}
+    ticker = validate_ticker(data.get("ticker", "AAPL"))
+    if not ticker:
+        return fail("Invalid ticker", status=400, code="bad_ticker")
     try:
         encoded = ticker.replace("&", "%26")
         rss_url = f"https://news.google.com/rss/search?q={encoded}+stock&hl=en-US&gl=US&ceid=US:en"
@@ -534,16 +804,17 @@ def news():
         return safe_jsonify({"ticker": ticker, "news": news_items, "average_sentiment": round(avg, 4),
                         "overall_label": "Positive" if avg > 0.05 else "Negative" if avg < -0.05 else "Neutral"})
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: AI ────────────────────────────────────────────
 @app.route("/api/ai", methods=["POST"])
+@limiter.limit(RATE_LIMIT_AI)
 def ai_overview():
-    data = request.json
-    ticker = data.get("ticker", "")
+    data = request.get_json(silent=True) or {}
+    ticker = validate_ticker(data.get("ticker", "")) or ""
     analysis_data = data.get("analysis", {})
     news_data = data.get("news", {})
-    user_question = data.get("question", "")
+    user_question = str(data.get("question", ""))[:500]  # cap to mitigate prompt-injection floods
 
     prompt = f"""You are a top-tier financial analyst. Here is the latest data for {ticker}:
 
@@ -572,7 +843,11 @@ Based on the data, provide:
     result = call_ai(prompt)
     if result:
         return safe_jsonify({"overview": result})
-    return safe_jsonify({"error": "AI unavailable. Please ensure Ollama is running: 'ollama serve' in terminal."}), 500
+    msg = (
+        "AI backend unavailable. Either start Ollama locally "
+        f"(`ollama serve` then `ollama pull {OLLAMA_MODEL}`) or set GEMINI_API_KEY in .env."
+    )
+    return safe_jsonify({"error": msg}), 503
 
 # ── Route: Excel Export ──────────────────────────────────
 @app.route("/api/export", methods=["POST"])
@@ -631,10 +906,13 @@ def export_excel():
 
 # ── Route: DCF Intrinsic Valuation ───────────────────────
 @app.route("/api/dcf", methods=["POST"])
+@limiter.limit(RATE_LIMIT_HEAVY)
 def dcf_valuation():
     try:
-        data = request.json
-        ticker = data.get("ticker", "AAPL").upper().strip()
+        data = request.get_json(silent=True) or {}
+        ticker = validate_ticker(data.get("ticker", "AAPL"))
+        if not ticker:
+            return fail("Invalid ticker", status=400, code="bad_ticker")
         tk = Toolkit(tickers=[ticker], api_key=FMP_API_KEY)
 
         income = tk.get_income_statement()
@@ -707,17 +985,22 @@ def dcf_valuation():
             "base_fcf": round(float(fcf), 0)
         }))
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Candlestick Pattern Recognition ───────────────
 @app.route("/api/patterns", methods=["POST"])
+@limiter.limit(RATE_LIMIT_HEAVY)
 def candlestick_patterns():
     try:
-        data = request.json
-        ticker = data.get("ticker", "AAPL").upper().strip()
+        data = request.get_json(silent=True) or {}
+        ticker = validate_ticker(data.get("ticker", "AAPL"))
+        if not ticker:
+            return fail("Invalid ticker", status=400, code="bad_ticker")
         prices = data.get("prices", [])
-        lookback = int(data.get("lookback_days", 7))
+        try:
+            lookback = max(1, min(int(data.get("lookback_days", 7)), 365))
+        except (TypeError, ValueError):
+            lookback = 7
         if len(prices) < 5:
             return safe_jsonify({"patterns": [], "message": "Not enough price data"})
 
@@ -803,8 +1086,7 @@ def candlestick_patterns():
                             "outlook": outlook, "lookback_days": lookback,
                             "bullish_count": bullish, "bearish_count": bearish, "neutral_count": neutral})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Analyst Ratings & Price Targets (Finnhub) ─────
 @app.route("/api/analyst", methods=["POST"])
@@ -847,8 +1129,7 @@ def analyst_ratings():
             }
         }))
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Insider Trading (Finnhub) ─────────────────────
 @app.route("/api/insider", methods=["POST"])
@@ -874,8 +1155,7 @@ def insider_trading():
 
         return safe_jsonify({"ticker": ticker, "transactions": result})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Market Sentiment (Fear & Greed + VIX) ─────────
 @app.route("/api/sentiment-market", methods=["POST"])
@@ -911,7 +1191,7 @@ def market_sentiment():
 
         return safe_jsonify(result)
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: FRED Economic Indicators ──────────────────────
 @app.route("/api/macro", methods=["POST"])
@@ -959,8 +1239,7 @@ def macro_indicators():
 
         return safe_jsonify({"indicators": indicators})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Earnings Calendar (Finnhub) ───────────────────
 @app.route("/api/earnings", methods=["POST"])
@@ -984,17 +1263,20 @@ def earnings_calendar():
 
         return safe_jsonify({"ticker": ticker, "earnings": earnings})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Monte Carlo Simulation ────────────────────────
 @app.route("/api/monte-carlo", methods=["POST"])
+@limiter.limit(RATE_LIMIT_HEAVY)
 def monte_carlo():
     try:
-        data = request.json
-        ticker = data.get("ticker", "AAPL").upper().strip()
-        days = int(data.get("days", 60))
-        simulations = int(data.get("simulations", 1000))
+        data = request.get_json(silent=True) or {}
+        ticker = validate_ticker(data.get("ticker", "AAPL"))
+        if not ticker:
+            return fail("Invalid ticker", status=400, code="bad_ticker")
+        # Cap to keep memory and CPU bounded (1000 sims × 252 days ≈ 2 MB float64)
+        days = max(1, min(int(data.get("days", 60) or 60), 252))
+        simulations = max(1, min(int(data.get("simulations", 1000) or 1000), 5000))
         prices = data.get("prices", [])
 
         if len(prices) < 30:
@@ -1034,8 +1316,7 @@ def monte_carlo():
             }
         }))
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Altman Z-Score ────────────────────────────────
 @app.route("/api/zscore", methods=["POST"])
@@ -1094,8 +1375,7 @@ def altman_zscore():
             }
         }))
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Dividend Analysis ─────────────────────────────
 @app.route("/api/dividends", methods=["POST"])
@@ -1123,8 +1403,7 @@ def dividend_analysis():
             "history": div_history,
         }))
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Correlation Matrix ────────────────────────────
 @app.route("/api/correlation", methods=["POST"])
@@ -1160,8 +1439,7 @@ def correlation_matrix():
 
         return safe_jsonify({"ticker": ticker, "tickers": list(corr.columns), "matrix": matrix})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Sector Performance Heatmap (Alpha Vantage) ────
 @app.route("/api/heatmap", methods=["POST"])
@@ -1192,28 +1470,8 @@ def sector_heatmap():
 
         return safe_jsonify({"sectors": sectors, "timeframes": list(timeframes.keys())})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
-# ── Route: Currency Conversion Rates ─────────────────────
-@app.route("/api/currency", methods=["POST"])
-def currency_rates():
-    """Return conversion rates from USD to GBP/INR so the frontend can convert all values."""
-    try:
-        import requests as req
-        url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=USD&to_currency=GBP&apikey={ALPHA_VANTAGE_KEY}"
-        resp = req.get(url, timeout=10).json()
-        usd_gbp = float(resp.get("Realtime Currency Exchange Rate", {}).get("5. Exchange Rate", 0.79))
-    except:
-        usd_gbp = 0.79  # Fallback
-    try:
-        import requests as req
-        url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency=USD&to_currency=INR&apikey={ALPHA_VANTAGE_KEY}"
-        resp = req.get(url, timeout=10).json()
-        usd_inr = float(resp.get("Realtime Currency Exchange Rate", {}).get("5. Exchange Rate", 83.5))
-    except:
-        usd_inr = 83.5
-    return safe_jsonify({"USD": 1.0, "GBP": usd_gbp, "INR": usd_inr})
 
 # ── Route: Options Chain (with Greeks) ───────────────────
 @app.route("/api/options/chain", methods=["POST"])
@@ -1263,8 +1521,7 @@ def options_chain():
             "put_count": len(puts),
         })
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Futures Data ──────────────────────────────────
 @app.route("/api/futures", methods=["POST"])
@@ -1304,8 +1561,7 @@ def futures_data():
             "price_history": price_history,
         })
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Forex Pair Data ───────────────────────────────
 @app.route("/api/forex", methods=["POST"])
@@ -1343,8 +1599,7 @@ def forex_data():
             "price_history": price_history,
         })
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Live Price (for auto-refresh) ─────────────────
 @app.route("/api/live-price", methods=["POST"])
@@ -1365,7 +1620,7 @@ def live_price():
             "timestamp": datetime.now().isoformat(),
         })
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Options Payoff Diagram ─────────────────────
 @app.route("/api/options/payoff", methods=["POST"])
@@ -1381,8 +1636,7 @@ def options_payoff():
         points = payoff_diagram(S, K, premium, opt_type, is_long)
         return safe_jsonify({"points": points, "strike": K, "premium": premium, "type": opt_type, "direction": "long" if is_long else "short"})
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Portfolio ──────────────────────────────────
 import portfolio_engine
@@ -1416,8 +1670,7 @@ def get_portfolio():
         summary["pending_orders"] = portfolio_engine.get_pending_orders()
         return safe_jsonify(summary)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/buy", methods=["POST"])
 def portfolio_buy():
@@ -1437,8 +1690,7 @@ def portfolio_buy():
             return safe_jsonify(result), 400
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/sell", methods=["POST"])
 def portfolio_sell():
@@ -1457,8 +1709,7 @@ def portfolio_sell():
             return safe_jsonify(result), 400
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/short", methods=["POST"])
 def portfolio_short():
@@ -1479,8 +1730,7 @@ def portfolio_short():
             return safe_jsonify(result), 400
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/cover", methods=["POST"])
 def portfolio_cover():
@@ -1500,8 +1750,7 @@ def portfolio_cover():
             return safe_jsonify(result), 400
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/limit-order", methods=["POST"])
 def portfolio_limit_order():
@@ -1519,8 +1768,7 @@ def portfolio_limit_order():
             return safe_jsonify(result), 400
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/stop-order", methods=["POST"])
 def portfolio_stop_order():
@@ -1538,8 +1786,7 @@ def portfolio_stop_order():
             return safe_jsonify(result), 400
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/orders", methods=["GET"])
 def portfolio_orders():
@@ -1547,7 +1794,7 @@ def portfolio_orders():
     try:
         return safe_jsonify({"orders": portfolio_engine.get_pending_orders()})
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/cancel-order", methods=["POST"])
 def portfolio_cancel_order():
@@ -1557,7 +1804,7 @@ def portfolio_cancel_order():
         order_id = int(data.get("order_id", 0))
         return safe_jsonify(portfolio_engine.cancel_order(order_id))
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/equity-curve", methods=["GET"])
 def portfolio_equity_curve():
@@ -1565,14 +1812,14 @@ def portfolio_equity_curve():
     try:
         return safe_jsonify({"curve": portfolio_engine.get_equity_curve()})
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/history", methods=["GET"])
 def portfolio_history():
     try:
         return safe_jsonify({"transactions": portfolio_engine.get_transactions()})
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/analytics", methods=["GET"])
 def portfolio_analytics():
@@ -1581,14 +1828,14 @@ def portfolio_analytics():
         current_prices = _fetch_live_prices([p["ticker"] for p in positions])
         return safe_jsonify(portfolio_engine.get_analytics(current_prices))
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 @app.route("/api/portfolio/reset", methods=["POST"])
 def portfolio_reset():
     try:
         return safe_jsonify(portfolio_engine.reset_portfolio())
     except Exception as e:
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 # ── Route: Market Summary (Dashboard) ────────────────
 _market_cache = {"data": None, "ts": 0}
@@ -1624,35 +1871,26 @@ def market_summary():
         result = {}
         for category, items in symbols.items():
             cat_list = []
-            tickers_str = " ".join([s[0] for s in items])
-            try:
-                data = yf.download(tickers_str, period="2d", group_by="ticker", progress=False)
-                for sym, name in items:
-                    try:
-                        if len(items) == 1:
-                            df = data
-                        else:
-                            df = data[sym] if sym in data.columns.get_level_values(0) else None
-
-                        if df is not None and len(df) >= 1:
-                            latest = df.iloc[-1]
-                            prev = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
-                            price = float(latest["Close"])
-                            prev_close = float(prev["Close"])
-                            change = price - prev_close
-                            change_pct = (change / prev_close * 100) if prev_close else 0
-                            cat_list.append({
-                                "symbol": sym, "name": name,
-                                "price": round(price, 2),
-                                "change": round(change, 2),
-                                "change_pct": round(change_pct, 2),
-                            })
-                        else:
-                            cat_list.append({"symbol": sym, "name": name, "price": 0, "change": 0, "change_pct": 0})
-                    except Exception:
+            for sym, name in items:
+                try:
+                    ticker = yf.Ticker(sym)
+                    hist = ticker.history(period="5d")
+                    if hist is not None and len(hist) >= 1:
+                        latest = hist.iloc[-1]
+                        prev = hist.iloc[-2] if len(hist) >= 2 else hist.iloc[-1]
+                        price = float(latest["Close"])
+                        prev_close = float(prev["Close"])
+                        change = price - prev_close
+                        change_pct = (change / prev_close * 100) if prev_close else 0
+                        cat_list.append({
+                            "symbol": sym, "name": name,
+                            "price": round(price, 2),
+                            "change": round(change, 2),
+                            "change_pct": round(change_pct, 2),
+                        })
+                    else:
                         cat_list.append({"symbol": sym, "name": name, "price": 0, "change": 0, "change_pct": 0})
-            except Exception:
-                for sym, name in items:
+                except Exception:
                     cat_list.append({"symbol": sym, "name": name, "price": 0, "change": 0, "change_pct": 0})
             result[category] = cat_list
 
@@ -1660,15 +1898,26 @@ def market_summary():
         _market_cache["ts"] = now
         return safe_jsonify(result)
     except Exception as e:
-        traceback.print_exc()
-        return safe_jsonify({"error": str(e)}), 500
+        return fail(str(e), status=500, log_exc=True)
 
 if __name__ == "__main__":
     import socket
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-    print(f"\n  FinanceIQ v5.2")
-    print(f"  Local:   http://localhost:5000")
-    print(f"  Network: http://{local_ip}:5000\n")
-    app.run(debug=True, port=5000, host="0.0.0.0")
+    host = os.environ.get("FLASK_HOST", "127.0.0.1")  # default loopback for safety
+    try:
+        port = int(os.environ.get("FLASK_PORT", "5000"))
+    except ValueError:
+        port = 5000
+
+    _startup_health_check()
+
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        local_ip = host
+    log.info("FinanceIQ ready")
+    log.info("  Local:   http://localhost:%s", port)
+    if host == "0.0.0.0":
+        log.info("  Network: http://%s:%s  (bound on all interfaces)", local_ip, port)
+
+    app.run(debug=IS_DEV, port=port, host=host)
 

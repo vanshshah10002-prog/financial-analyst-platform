@@ -1,7 +1,28 @@
-flask>=3.0
-yfinance>=1.0
-financetoolkit>=2.0
-openpyxl>=3.1
-requests>=2.31
-requests-cache>=1.2
-python-dotenv>=1.0
+# ── Web framework ─────────────────────────────────────────
+flask>=3.0,<4.0
+flask-limiter>=3.5,<4.0          # rate limiting on hot API routes
+python-dotenv>=1.0,<2.0
+
+# ── Market data ───────────────────────────────────────────
+yfinance>=0.2.40                 # Yahoo Finance fallback + live prices
+financetoolkit>=2.0              # FMP-backed fundamentals
+requests>=2.31,<3.0
+requests-cache>=1.2              # cache upstream API responses
+feedparser>=6.0                  # Google News RSS
+
+# ── Numerics / data ───────────────────────────────────────
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10                      # Black-Scholes (norm.cdf/pdf)
+
+# ── Sentiment / news / macro ──────────────────────────────
+vaderSentiment>=3.3              # news sentiment scoring
+fear_and_greed>=0.2              # CNN Fear & Greed index
+fredapi>=0.5                     # FRED macro series
+
+# ── Exports ───────────────────────────────────────────────
+openpyxl>=3.1                    # XLSX export
+
+# ── AI (optional, at least one needed for /api/ai) ────────
+google-genai>=0.3                # Google Gemini fallback when Ollama is unreachable
+# Ollama is a local binary — install separately from https://ollama.com

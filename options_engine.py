@@ -92,33 +92,70 @@ def calculate_greeks(S, K, T, r, sigma, option_type="call"):
     }
 
 
+SIGMA_MIN = 1e-4
+SIGMA_MAX = 5.0   # 500% vol — anything beyond is meaningless and numerically unstable
+
+
+def _bs_price(option_type, S, K, T, r, sigma):
+    if option_type == "call":
+        return bs_call_price(S, K, T, r, sigma)
+    return bs_put_price(S, K, T, r, sigma)
+
+
 def implied_volatility(market_price, S, K, T, r, option_type="call", tol=1e-6, max_iter=100):
-    """
-    Calculate implied volatility using Newton-Raphson method.
-    """
-    if T <= 0 or market_price <= 0:
-        return 0.0
+    """Implied volatility via Newton-Raphson with bisection fallback.
 
-    sigma = 0.3  # initial guess
+    Newton can diverge when vega is tiny (deep OTM, near-expiry). When that happens we
+    fall back to bisection on [SIGMA_MIN, SIGMA_MAX], which always converges.
+    Returns ``None`` if no valid IV exists (e.g. arbitrage / bad input).
+    """
+    if T <= 0 or market_price <= 0 or S <= 0 or K <= 0:
+        return None
+
+    # Intrinsic value: if market price < intrinsic, no real IV exists.
+    intrinsic = max(S - K, 0) if option_type == "call" else max(K - S, 0)
+    if market_price < intrinsic - tol:
+        return None
+
+    # ── Newton-Raphson first (fast when it converges) ──
+    sigma = 0.3
     for _ in range(max_iter):
-        if option_type == "call":
-            price = bs_call_price(S, K, T, r, sigma)
-        else:
-            price = bs_put_price(S, K, T, r, sigma)
-
+        try:
+            price = _bs_price(option_type, S, K, T, r, sigma)
+        except (ValueError, OverflowError):
+            break
         diff = price - market_price
         if abs(diff) < tol:
-            return round(sigma, 6)
-
-        # Vega for Newton-Raphson step
+            return round(max(sigma, SIGMA_MIN), 6)
         _d1 = d1(S, K, T, r, sigma)
         vega = S * math.sqrt(T) * norm.pdf(_d1)
-        if vega < 1e-12:
+        if vega < 1e-8:
+            break  # Newton would explode; fall through to bisection
+        step = diff / vega
+        sigma_new = sigma - step
+        if not (SIGMA_MIN <= sigma_new <= SIGMA_MAX) or math.isnan(sigma_new):
             break
-        sigma -= diff / vega
-        sigma = max(sigma, 0.001)  # floor
+        sigma = sigma_new
 
-    return round(sigma, 6)
+    # ── Bisection fallback (slow but bullet-proof) ──
+    lo, hi = SIGMA_MIN, SIGMA_MAX
+    try:
+        f_lo = _bs_price(option_type, S, K, T, r, lo) - market_price
+        f_hi = _bs_price(option_type, S, K, T, r, hi) - market_price
+    except (ValueError, OverflowError):
+        return None
+    if f_lo * f_hi > 0:
+        return None  # market price outside achievable BS range
+    for _ in range(80):  # ~log2(5/1e-4) ≈ 15 steps suffice
+        mid = 0.5 * (lo + hi)
+        f_mid = _bs_price(option_type, S, K, T, r, mid) - market_price
+        if abs(f_mid) < tol:
+            return round(mid, 6)
+        if f_lo * f_mid < 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return round(0.5 * (lo + hi), 6)
 
 
 def payoff_diagram(S, K, premium, option_type="call", is_long=True, num_points=50):

@@ -42,3 +42,6 @@ portfolio.db-shm
 
 # Assignment PDFs
 *.pdf
+
+# Local Claude Code tooling
+.claude/
