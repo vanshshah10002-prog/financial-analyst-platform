@@ -130,7 +130,7 @@ Rate limits (per-IP, override via env):
 
 ## 📜 License
 
-This project is for educational purposes. Built as part of MSc Financial Technology coursework.
+MIT — see [LICENSE](LICENSE). Built as part of MSc Financial Technology coursework.
 
 ---
 
